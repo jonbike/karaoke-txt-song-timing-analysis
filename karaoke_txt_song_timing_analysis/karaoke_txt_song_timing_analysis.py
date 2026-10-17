@@ -1,97 +1,84 @@
 #!/usr/bin/env python3
-"""Estimate UltraStar lyric GAP corrections; never modify song files."""
+"""Read-only, first-pass UltraStar GAP analysis."""
 
 import argparse
 import re
-import sys
 from pathlib import Path
 
 LANGUAGES = ("en", "de", "it", "ko")
-
-HEADER_RE = re.compile(r"^\s*#([A-Z0-9_]+)\s*:\s*(.*?)\s*$", re.I)
-NOTE_RE = re.compile(r"^\s*[:*FRG]\s+(-?\d+)\s+\d+\s+-?\d+\s+(.+?)\s*$")
-
-
-def parse_number(value):
-    return float(value.strip().replace(",", "."))
+AUDIO_EXTENSIONS = {
+    ".mp3", ".ogg", ".opus", ".wav", ".flac", ".m4a", ".aac", ".wma"
+}
+META_RE = re.compile(r"^#([A-Z0-9_]+)\s*:\s*(.*)$", re.I)
+NOTE_RE = re.compile(r"^[:FRGB-]\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*(.*)$")
 
 
-def read_song(path):
-    # UltraStar files are normally UTF-8; tolerate older legacy files.
-    raw = path.read_bytes()
-    text = None
-    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
-        try:
-            text = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
+def parse_chart(path):
+    gap = bpm = first_beat = None
+    audio_name = None
+    first_lyric = ""
+    relative = False
 
-    headers = {}
-    first_note_beat = None
-    first_note_text = ""
+    for line in path.read_text(
+        encoding="utf-8-sig", errors="replace"
+    ).splitlines():
+        line = line.strip()
+        meta = META_RE.match(line)
 
-    for line in text.splitlines():
-        match = HEADER_RE.match(line)
-        if match:
-            headers[match.group(1).upper()] = match.group(2)
+        if meta:
+            key, value = meta.group(1).upper(), meta.group(2).strip()
+            try:
+                if key == "GAP":
+                    gap = float(value.replace(",", "."))
+                elif key == "BPM":
+                    bpm = float(value.replace(",", "."))
+            except ValueError:
+                pass
+
+            if key in ("AUDIO", "MP3"):
+                audio_name = value
+            elif key == "RELATIVE":
+                relative = value.lower() in ("yes", "true", "1")
             continue
 
         note = NOTE_RE.match(line)
-        if note:
-            first_note_beat = int(note.group(1))
-            first_note_text = note.group(2)
-            break
+        if note and first_beat is None:
+            first_beat = float(note.group(1))
+            first_lyric = note.group(4).replace("|", " ").strip()[:100]
 
-    if first_note_beat is None:
-        raise ValueError("no lyric notes found")
-
-    if "BPM" not in headers:
-        raise ValueError("missing #BPM")
-
-    bpm = parse_number(headers["BPM"])
-    if bpm <= 0:
-        raise ValueError("invalid #BPM")
-
-    gap = parse_number(headers.get("GAP", "0"))
-    relative = headers.get("RELATIVE", "no").strip().lower() == "yes"
-
-    audio_name = headers.get("AUDIO") or headers.get("MP3")
-    if not audio_name:
-        raise ValueError("missing #AUDIO or #MP3")
-
-    audio_path = (path.parent / audio_name).resolve()
-    if not audio_path.is_file():
-        raise ValueError(f"audio file not found: {audio_name}")
-
-    # First-note time: GAP plus beat position, in milliseconds.
-    # BPM in UltraStar is normally four times musical quarter-note BPM.
-    first_lyric_ms = gap + first_note_beat * 60000.0 / (bpm * 4.0)
-
-    return {
-        "title": headers.get("TITLE", path.stem),
-        "artist": headers.get("ARTIST", "Unknown"),
-        "audio": audio_path,
-        "gap": gap,
-        "bpm": bpm,
-        "beat": first_note_beat,
-        "lyric_ms": first_lyric_ms,
-        "lyric": first_note_text,
-        "relative": relative,
-    }
+    return gap, bpm, audio_name, first_beat, first_lyric, relative
 
 
-def detect_first_word(audio_path, language, model, device, batch_size):
-    import whisperx
+def find_audio(chart, audio_name):
+    folder = chart.parent
 
+    if audio_name:
+        named = Path(audio_name)
+        candidates = [
+            named if named.is_absolute() else folder / named,
+            folder / named.name,
+        ]
+        for candidate in candidates:
+            if candidate.is_file() and candidate.suffix.lower() in AUDIO_EXTENSIONS:
+                return candidate
+
+    for candidate in folder.iterdir():
+        if (candidate.is_file()
+                and candidate.suffix.lower() in AUDIO_EXTENSIONS
+                and candidate.stem.casefold() == chart.stem.casefold()):
+            return candidate
+
+    return None
+
+
+def first_word_time(audio_path, language, whisperx, model, device):
     audio = whisperx.load_audio(str(audio_path))
-    result = model.transcribe(audio, batch_size=batch_size)
-
+    result = model.transcribe(audio, batch_size=4)
     segments = result.get("segments", [])
-    if not segments:
-        raise ValueError("speech recognition returned no words")
 
-    # Prefer word-level alignment when the language model is available.
+    if not segments:
+        return None, "", "No speech recognized"
+
     try:
         align_model, metadata = whisperx.load_align_model(
             language_code=language, device=device
@@ -100,154 +87,154 @@ def detect_first_word(audio_path, language, model, device, batch_size):
             segments, align_model, metadata, audio, device,
             return_char_alignments=False,
         )
-
-        words = []
-        for segment in aligned.get("segments", []):
-            for word in segment.get("words", []):
-                if word.get("start") is not None and word.get("word", "").strip():
-                    words.append(word)
-
-        if words:
-            first = min(words, key=lambda w: w["start"])
-            return float(first["start"]), first["word"].strip(), "word alignment"
-
+        segments = aligned.get("segments", [])
     except Exception as exc:
-        alignment_note = f"word alignment unavailable: {exc}"
-    else:
-        alignment_note = "word alignment returned no timed words"
+        first = segments[0]
+        return (
+            first.get("start"),
+            str(first.get("text", "")).strip(),
+            f"Low confidence: word alignment unavailable ({type(exc).__name__})",
+        )
 
-    # Fallback: segment-level start time, less precise than word alignment.
-    valid = [
-        s for s in segments
-        if s.get("start") is not None and s.get("text", "").strip()
+    words = [
+        word
+        for segment in segments
+        for word in segment.get("words", [])
+        if word.get("start") is not None
+        and str(word.get("word", "")).strip()
     ]
-    if not valid:
-        raise ValueError("no timed transcription segments")
 
-    first = min(valid, key=lambda s: s["start"])
-    first_text = first["text"].strip().split()[0]
+    if not words:
+        return None, "", "No aligned word timestamps"
+
+    words.sort(key=lambda word: word["start"])
+    preview = " ".join(
+        str(word.get("word", "")).strip() for word in words[:8]
+    )
     return (
-        float(first["start"]),
-        first_text,
-        f"segment estimate; {alignment_note}",
+        float(words[0]["start"]),
+        preview,
+        "Low confidence: singing recognition and onset need listening review",
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Check UltraStar first-lyric timing against recognized vocals."
+        description="Estimate GAP corrections; never edits song files."
     )
-    parser.add_argument("--folder", required=True, type=Path,
-                        help="Song folder; searched recursively")
-    parser.add_argument("--language", required=True, choices=LANGUAGES,
-                        help="en, de, it, or ko")
-    parser.add_argument("--output", type=Path,
-                        help="Report path (default: FOLDER/sync_report.txt)")
-    parser.add_argument("--model", default="small",
-                        help="Whisper model size (default: small; e.g. medium)")
+    parser.add_argument("--source", default="~/Music")
+    parser.add_argument("--language", choices=LANGUAGES, required=True)
+    parser.add_argument(
+        "--report", default="~/Music/ultrastar_gap_report.txt"
+    )
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--min-correction-ms", type=float, default=80,
-                        help="Smaller differences are reported as near-synced")
     args = parser.parse_args()
 
-    folder = args.folder.expanduser().resolve()
-    if not folder.is_dir():
-        parser.error(f"not a directory: {folder}")
+    source = Path(args.source).expanduser().resolve()
+    report = Path(args.report).expanduser().resolve()
 
-    report_path = (
-        args.output.expanduser().resolve()
-        if args.output else folder / "sync_report.txt"
-    )
-
-    songs = sorted(folder.rglob("*.txt"))
-    songs = [
-        p for p in songs
-        if p.resolve() != report_path
-        and not p.name.endswith(".bak.txt")
-        and not p.name.endswith(".txt.bak")
-    ]
-    if not songs:
-        parser.error("no .txt song files found")
+    if not source.is_dir():
+        raise SystemExit(f"Source directory not found: {source}")
 
     try:
         import whisperx
-        import torch
     except ImportError:
-        sys.exit("Missing dependencies. Activate your venv and run: pip install whisperx")
+        raise SystemExit(
+            "WhisperX missing. Activate your virtual environment and run:\n"
+            "pip install whisperx"
+        )
 
-    device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        sys.exit("CUDA requested but unavailable. Try --device cpu.")
+    charts = []
+    for path in sorted(source.rglob("*.txt")):
+        if path.resolve() == report:
+            continue
+        try:
+            data = parse_chart(path)
+        except OSError:
+            continue
+        gap, bpm, audio_name, beat, lyric, relative = data
+        if gap is not None or bpm is not None or beat is not None:
+            charts.append((path, data))
 
-    compute_type = "int8" if device == "cpu" else "float16"
-    print(f"Loading WhisperX model '{args.model}' for {args.language}...")
+    if not charts:
+        raise SystemExit(f"No likely UltraStar charts found in {source}")
+
     model = whisperx.load_model(
-        args.model,
-        device,
-        language=args.language,
-        compute_type=compute_type,
+        "small", args.device, language=args.language, compute_type="int8"
     )
 
-    lines = [
-        "UltraStar synchronization report",
-        "=" * 32,
-        f"Folder: {folder}",
+    output = [
+        "ULTRASTAR GAP-ONLY ANALYSIS",
+        "===========================",
+        f"Source: {source}",
         f"Language: {args.language}",
-        f"Songs scanned: {len(songs)}",
-        "Mode: report only; no song files will be changed",
+        f"Charts found: {len(charts)}",
+        "",
+        "IMPORTANT:",
+        "- No song files are modified.",
+        "- Suggested corrections are estimates, not guaranteed fixes.",
+        "- Instrumental intros and backing vocals can mislead speech recognition.",
+        "- #RELATIVE charts and charts with missing timing data are skipped.",
+        "- BPM drift and the final word are NOT analyzed in this stage.",
+        "- Positive correction means increasing #GAP to delay the chart.",
         "",
     ]
 
-    for index, path in enumerate(songs, 1):
-        print(f"[{index}/{len(songs)}] {path.name}")
-        lines.extend([f"Song file: {path}", "-" * 60])
+    for number, (chart, data) in enumerate(charts, 1):
+        gap, bpm, audio_name, beat, lyric, relative = data
+        audio_path = find_audio(chart, audio_name)
+        chart_time = None
+        onset = None
+        words = ""
+        note = ""
 
-        try:
-            song = read_song(path)
-            detected_s, word, method = detect_first_word(
-                song["audio"], args.language, model, device, args.batch_size
-            )
-
-            detected_ms = detected_s * 1000.0
-            difference_ms = detected_ms - song["lyric_ms"]
-            proposed_gap = song["gap"] + difference_ms
-
-            lines.extend([
-                f"Title: {song['title']}",
-                f"Artist: {song['artist']}",
-                f"Audio: {song['audio'].name}",
-                f"First lyric text: {song['lyric']}",
-                f"First recognized word: {word}",
-                f"Current GAP: {song['gap']:.0f} ms",
-                f"First lyric timestamp: {song['lyric_ms']:.0f} ms",
-                f"Detected word start: {detected_ms:.0f} ms",
-                f"Suggested correction: {difference_ms:+.0f} ms",
-                f"Suggested GAP: {proposed_gap:.0f} ms",
-                f"Detection method: {method}",
-            ])
-
-            if abs(difference_ms) < args.min_correction_ms:
-                status = "NEAR SYNC (within threshold)"
-            elif proposed_gap < 0:
-                status = "REVIEW: suggested GAP is negative"
-            elif song["relative"]:
-                status = "REVIEW: #RELATIVE is enabled"
+        if relative:
+            note = "#RELATIVE chart; skipped"
+        elif gap is None or bpm is None or bpm <= 0 or beat is None:
+            note = "Missing or invalid GAP/BPM/first-note data"
+        else:
+            # Approximate UltraStar chart timing; verify suggestions in-game.
+            chart_time = gap / 1000.0 + beat * 60.0 / bpm
+            if audio_path is None:
+                note = "Audio file not found"
             else:
-                status = "REVIEW RECOMMENDED"
+                try:
+                    onset, words, note = first_word_time(
+                        audio_path, args.language, whisperx, model, args.device
+                    )
+                except Exception as exc:
+                    note = f"Recognition failed: {type(exc).__name__}: {exc}"
 
-            lines.extend([f"Status: {status}", ""])
+        correction = None
+        suggested = None
+        if onset is not None and chart_time is not None:
+            correction = (onset - chart_time) * 1000
+            suggested = gap + correction
 
-        except Exception as exc:
-            lines.extend([
-                f"Status: ERROR - {type(exc).__name__}: {exc}",
-                "",
-            ])
-            print(f"  Error: {exc}", file=sys.stderr)
+        output.extend([
+            "-" * 72,
+            f"Chart: {chart}",
+            f"Audio: {audio_path or 'NOT FOUND'}",
+            f"First chart lyric: {lyric or '(not parsed)'}",
+            f"Recognized opening words: {words or '(none)'}",
+            f"Current #GAP: {gap if gap is not None else 'MISSING'} ms",
+            f"#BPM: {bpm if bpm is not None else 'MISSING'}",
+            f"Chart first-note time: {chart_time:.3f} s"
+                if chart_time is not None else "Chart first-note time: unavailable",
+            f"Recognized first-word time: {onset:.3f} s"
+                if onset is not None else "Recognized first-word time: unavailable",
+            f"Estimated GAP correction: {correction:+.0f} ms"
+                if correction is not None else "Estimated GAP correction: unavailable",
+            f"Suggested #GAP: {suggested:.0f} ms"
+                if suggested is not None else "Suggested #GAP: unavailable",
+            f"Confidence: {note}",
+            "",
+        ])
 
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"\nReport written to: {report_path}")
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("\n".join(output), encoding="utf-8")
+    print(f"\nReport saved to: {report}")
+    print("Original song files were not modified.")
 
 
 if __name__ == "__main__":
