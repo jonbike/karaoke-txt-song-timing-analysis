@@ -820,7 +820,7 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
     lines = [
         "UltraStar GAP Analysis Report",
         "=" * 78,
-        f"Generated: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         "Safety: source audio and chart files were read only.",
         f"Match threshold: {args.match_threshold:.2f}",
@@ -847,6 +847,17 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
                 "Whisper transcription (opening):",
                 result.transcription,
             ])
+
+        if result.chart_words:
+            chart_opening_words = [
+                word.text for word in result.chart_words
+                if word.seconds <= args.chart_opening_seconds
+            ]
+            if chart_opening_words:
+                lines.extend([
+                    "Chart transcription (opening):",
+                    " ".join(chart_opening_words),
+                ])
 
         if result.matches:
             lines.extend([
