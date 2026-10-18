@@ -44,9 +44,12 @@ NOTE_RE = re.compile(
     re.IGNORECASE,
 )
 
-GAP_RE = re.compile(r"^\s*#GAP:\s*(-?\d+(?:\.\d+)?)", re.I)
-BPM_RE = re.compile(r"^\s*#BPM:\s*(-?\d+(?:\.\d+)?)", re.I)
+NUMBER_RE = r"[+-]?\d+(?:[.,]\d+)?"
+GAP_RE = re.compile(rf"^\s*#GAP:\s*({NUMBER_RE})", re.I)
+BPM_RE = re.compile(rf"^\s*#BPM:\s*({NUMBER_RE})", re.I)
+AUDIO_RE = re.compile(r"^\s*#AUDIO:\s*(.*?)\s*$", re.I)
 MP3_RE = re.compile(r"^\s*#MP3:\s*(.*?)\s*$", re.I)
+RELATIVE_RE = re.compile(r"^\s*#RELATIVE:\s*(.*?)\s*$", re.I)
 
 TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?", re.I)
 
@@ -150,6 +153,12 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
     raw_words: list[tuple[str, float]] = []
     pending_text = ""
     pending_beat: Optional[float] = None
+    relative_timing = False
+    previous_start_beat = 0.0
+
+    def parse_number(value: str) -> float:
+        """Parse UltraStar numeric fields with either decimal separator."""
+        return float(value.replace(",", "."))
 
     def flush_pending_word() -> None:
         nonlocal pending_text, pending_beat
@@ -165,18 +174,25 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
             # they carry the word-boundary information.
             line = line.rstrip("\r\n")
 
+            relative_match = RELATIVE_RE.match(line)
+            if relative_match:
+                relative_timing = relative_match.group(1).strip().casefold() == "yes"
+                continue
+
             gap_match = GAP_RE.match(line)
             if gap_match:
-                gap_ms = float(gap_match.group(1))
+                gap_ms = parse_number(gap_match.group(1))
                 continue
 
             bpm_match = BPM_RE.match(line)
             if bpm_match:
-                bpm = float(bpm_match.group(1))
+                bpm = parse_number(bpm_match.group(1))
                 continue
 
-            # A phrase break ends any unfinished word.
-            if re.match(r"^\s*-\s*-?\d+(?:\s+-?\d+)*\s*$", line):
+            # A phrase break ends any unfinished word. It does not replace the
+            # previous note as the reference for subsequent relative note beats.
+            phrase_match = re.match(r"^\s*-\s*(-?\d+)(?:\s+-?\d+)*\s*$", line)
+            if phrase_match:
                 flush_pending_word()
                 continue
 
@@ -184,7 +200,9 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
             if not note_match:
                 continue
 
-            beat = int(note_match.group(2))
+            encoded_beat = float(int(note_match.group(2)))
+            beat = previous_start_beat + encoded_beat if relative_timing else encoded_beat
+            previous_start_beat = beat
             lyric = note_match.group(5)
 
             # A tilde is a note-extension marker, not a sung word. It also
@@ -231,15 +249,33 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
     return gap_ms, bpm, words
 
 
-def read_mp3_reference(chart_path: Path) -> Optional[str]:
-    """Read the chart's #MP3 filename, preserving UltraStar's source of truth."""
+def read_audio_reference(chart_path: Path) -> tuple[Optional[str], Optional[str]]:
+    """Read #AUDIO preferentially, with legacy #MP3 support."""
+    audio_value: Optional[str] = None
+    mp3_value: Optional[str] = None
     with chart_path.open("r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
-            match = MP3_RE.match(line.rstrip("\r\n"))
-            if match:
+            line = line.rstrip("\r\n")
+            match = AUDIO_RE.match(line)
+            if match and audio_value is None:
                 value = match.group(1).strip().strip('"').strip("'").strip()
-                return value or None
-    return None
+                audio_value = value or None
+                continue
+            match = MP3_RE.match(line)
+            if match and mp3_value is None:
+                value = match.group(1).strip().strip('"').strip("'").strip()
+                mp3_value = value or None
+    if audio_value:
+        return "#AUDIO", audio_value
+    if mp3_value:
+        return "#MP3", mp3_value
+    return None, None
+
+
+def read_mp3_reference(chart_path: Path) -> Optional[str]:
+    """Compatibility wrapper returning the selected audio filename."""
+    _tag, value = read_audio_reference(chart_path)
+    return value
 
 
 def resolve_case_insensitive(path: Path) -> Optional[Path]:
@@ -278,19 +314,13 @@ def resolve_case_insensitive(path: Path) -> Optional[Path]:
 
 
 def find_audio_for_chart(chart_path: Path) -> Optional[Path]:
-    """Find the audio named by #MP3, relative to the chart's directory.
-
-    If a chart has no #MP3 tag, retain the old same-basename lookup as a
-    compatibility fallback. If #MP3 is present but points to a missing file,
-    do not silently choose a different track.
-    """
+    """Find audio from #AUDIO or legacy #MP3; otherwise use same-basename lookup."""
     supported = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".aac", ".opus"}
-    mp3_reference = read_mp3_reference(chart_path)
+    reference_tag, audio_reference = read_audio_reference(chart_path)
 
-    if mp3_reference:
-        # UltraStar chart references are normally relative to the song folder.
-        # Normalize Windows separators so charts remain portable across OSes.
-        reference = Path(mp3_reference.replace("\\", "/")).expanduser()
+    if audio_reference:
+        # Prefer #AUDIO; legacy #MP3 is selected only when #AUDIO is absent.
+        reference = Path(audio_reference.replace("\\", "/")).expanduser()
         candidate = reference if reference.is_absolute() else chart_path.parent / reference
         resolved = resolve_case_insensitive(candidate)
         if resolved and resolved.suffix.casefold() in supported:
@@ -741,14 +771,15 @@ def analyze_chart(
         return analysis
 
     if audio_path is None:
-        mp3_reference = read_mp3_reference(chart_path)
-        if mp3_reference:
+        reference_tag, audio_reference = read_audio_reference(chart_path)
+        if audio_reference:
             analysis.reason = (
-                f"No audio file referenced by #MP3 ({mp3_reference!r}) was found."
+                f"No audio file referenced by {reference_tag} "
+                f"({audio_reference!r}) was found."
             )
         else:
             analysis.reason = (
-                "No #MP3 reference or same-basename audio file was found."
+                "No #AUDIO/#MP3 reference or same-basename audio file was found."
             )
         return analysis
 
