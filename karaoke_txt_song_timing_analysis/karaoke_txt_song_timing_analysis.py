@@ -39,7 +39,8 @@ from typing import Optional
 
 
 NOTE_RE = re.compile(
-    r"^[:*]\s*(-?\d+)\s+(\d+)\s+(-?\d+)\s+(.*)$"
+    r"^([:*FRG])\s*(-?\d+)\s+(\d+)\s+(-?\d+)\s+(.*)$",
+    re.IGNORECASE,
 )
 
 GAP_RE = re.compile(r"^\s*#GAP:\s*(-?\d+(?:\.\d+)?)", re.I)
@@ -135,13 +136,33 @@ def word_similarity(a: str, b: str) -> float:
 
 
 def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[ChartWord]]:
-    """Read BPM, GAP and lyric words with their chart beat positions."""
+    """Read BPM, GAP and reconstruct complete lyric words from note fragments.
+
+    UltraStar note text may be a syllable rather than a whole word. A trailing
+    space marks the end of a lyric word, so that whitespace must be inspected
+    before stripping or normalizing the text. Phrase-break lines also terminate
+    any pending word. The word's timing is the beat of its first fragment.
+    """
     bpm = None
     gap_ms = None
     raw_words: list[tuple[str, float]] = []
+    pending_text = ""
+    pending_beat: Optional[float] = None
+
+    def flush_pending_word() -> None:
+        nonlocal pending_text, pending_beat
+        word = normalize_word(pending_text)
+        if word and pending_beat is not None:
+            raw_words.append((word, pending_beat))
+        pending_text = ""
+        pending_beat = None
 
     with path.open("r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
+            # Remove only the line ending. Do not strip lyric trailing spaces:
+            # they carry the word-boundary information.
+            line = line.rstrip("\r\n")
+
             gap_match = GAP_RE.match(line)
             if gap_match:
                 gap_ms = float(gap_match.group(1))
@@ -152,24 +173,43 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
                 bpm = float(bpm_match.group(1))
                 continue
 
-            note_match = NOTE_RE.match(line.rstrip("\r\n"))
+            # A phrase break ends any unfinished word.
+            if re.match(r"^\s*-\s*-?\d+\s*$", line):
+                flush_pending_word()
+                continue
+
+            note_match = NOTE_RE.match(line)
             if not note_match:
                 continue
 
-            beat = int(note_match.group(1))
-            lyric = note_match.group(4)
+            beat = int(note_match.group(2))
+            lyric = note_match.group(5)
 
-            # UltraStar commonly uses a trailing space to mark a word end.
-            # Keep the text of each note separate and split note text into
-            # tokens rather than joining the whole song into one string.
-            lyric = lyric.replace("~", " ")
-            for token in tokens(lyric):
-                raw_words.append((token, float(beat)))
+            # A tilde is a note-extension marker, not a sung word. It also
+            # safely closes any pending lyric word before the extension.
+            if lyric.strip() == "~":
+                flush_pending_word()
+                continue
+
+            # Detect the boundary before removing whitespace. Notes such as
+            # "an", "ti", "christ " become the complete word "antichrist".
+            ends_word = bool(lyric) and lyric[-1].isspace()
+            fragment = lyric.strip()
+
+            if fragment:
+                if pending_beat is None:
+                    pending_beat = float(beat)
+                pending_text += fragment
+
+            if ends_word:
+                flush_pending_word()
+
+    # Don't lose the final word if the file ends without a trailing space.
+    flush_pending_word()
 
     if bpm is None or bpm <= 0:
         return gap_ms, bpm, []
 
-    # The chart beat coordinate is converted using the chart BPM.
     words = [
         ChartWord(
             text=text,
