@@ -86,6 +86,15 @@ class Match:
 
 
 @dataclass
+class BpmSample:
+    label: str
+    chart_time_seconds: float
+    offset_ms: float
+    match_count: int
+    spread_ms: float
+
+
+@dataclass
 class Analysis:
     chart_path: Path
     audio_path: Optional[Path]
@@ -101,6 +110,11 @@ class Analysis:
     audio_duration: Optional[float] = None
     chart_words: Optional[list[ChartWord]] = None
     unknown_note_types: Optional[list[tuple[str, int]]] = None
+    bpm_samples: Optional[list[BpmSample]] = None
+    suggested_bpm: Optional[float] = None
+    bpm_correction: Optional[float] = None
+    bpm_confidence: str = "Not assessed"
+    bpm_reason: str = ""
 
 
 def normalize_word(text: str) -> str:
@@ -381,19 +395,21 @@ def is_existing_ultrastar_chart(path: Path) -> bool:
     return False
 
 
-def transcribe_opening(
+def transcribe_audio_windows(
     audio_path: Path,
     model_name: str,
     language: Optional[str],
     device: str,
     compute_type: str,
     opening_seconds: float,
-) -> tuple[list[AudioWord], float, str, str]:
-    """
-    Transcribe and align the opening section with WhisperX.
+    extra_windows: list[tuple[str, float, float]],
+) -> tuple[list[AudioWord], float, str, str, dict[str, list[AudioWord]]]:
+    """Transcribe the opening plus selected later windows, loading models once.
 
-    WhisperX versions differ slightly in return types, so this function
-    validates the returned data and gives a useful error when incompatible.
+    Extra windows are (label, start_seconds, duration_seconds). Their timestamps
+    are converted back to absolute audio time so they can be compared directly
+    with chart note times. This samples the song without transcribing the whole
+    audio file, keeping the additional BPM check relatively inexpensive.
     """
     try:
         import whisperx
@@ -406,8 +422,18 @@ def transcribe_opening(
     sample_rate = 16000
     full_duration = len(audio) / sample_rate
 
-    opening_samples = int(min(full_duration, opening_seconds) * sample_rate)
-    audio_opening = audio[:opening_samples]
+    windows: list[tuple[str, float, object]] = []
+    opening_end = min(full_duration, opening_seconds)
+    windows.append(("opening", 0.0, audio[: int(opening_end * sample_rate)]))
+
+    for label, requested_start, requested_duration in extra_windows:
+        if requested_duration <= 0 or full_duration <= 0:
+            continue
+        start = max(0.0, requested_start)
+        end = min(full_duration, start + requested_duration)
+        if end - start < min(3.0, requested_duration * 0.6):
+            continue
+        windows.append((label, start, audio[int(start * sample_rate):int(end * sample_rate)]))
 
     model = whisperx.load_model(
         model_name,
@@ -416,94 +442,178 @@ def transcribe_opening(
         language=language,
     )
 
-    result = model.transcribe(
-        audio_opening,
-        batch_size=4,
-        language=language,
-    )
-
-    if not isinstance(result, dict):
-        raise TypeError(
-            "WhisperX transcription returned "
-            f"{type(result).__name__}, expected a dictionary."
+    raw_windows: list[tuple[str, float, object, dict]] = []
+    detected_language = language or "en"
+    opening_text = ""
+    for index, (label, start, chunk) in enumerate(windows):
+        result = model.transcribe(
+            chunk,
+            batch_size=4,
+            language=language,
         )
-
-    segments = result.get("segments", [])
-    detected_language = result.get("language") or language or "en"
-    transcription_text = str(result.get("text", "") or "")
-
-    if not transcription_text:
-        transcription_text = " ".join(
-            str(seg.get("text", ""))
-            for seg in segments
-            if isinstance(seg, dict)
-        ).strip()
-
-    if not segments:
-        return [], full_duration, transcription_text, detected_language
-
-    align_model, metadata = whisperx.load_align_model(
-        language_code=detected_language,
-        device=device,
-    )
-
-    aligned_result = whisperx.align(
-        segments,
-        align_model,
-        metadata,
-        audio_opening,
-        device,
-        return_char_alignments=False,
-    )
-
-    # Some versions return (aligned_result, metadata); others return only
-    # the aligned result.
-    if isinstance(aligned_result, tuple):
-        aligned_result = aligned_result[0]
-
-    if not isinstance(aligned_result, dict):
-        raise TypeError(
-            "WhisperX alignment returned "
-            f"{type(aligned_result).__name__}, expected a dictionary."
-        )
-
-    audio_words: list[AudioWord] = []
-
-    for segment in aligned_result.get("segments", []):
-        if not isinstance(segment, dict):
-            continue
-
-        for item in segment.get("words", []):
-            if not isinstance(item, dict):
-                continue
-
-            word = str(item.get("word", "")).strip()
-            start = item.get("start")
-            end = item.get("end")
-
-            if not word or start is None or end is None:
-                continue
-
-            try:
-                start = float(start)
-                end = float(end)
-            except (TypeError, ValueError):
-                continue
-
-            if not math.isfinite(start) or not math.isfinite(end):
-                continue
-
-            audio_words.append(
-                AudioWord(
-                    text=word,
-                    start=start,
-                    end=end,
-                    index=len(audio_words),
-                )
+        if not isinstance(result, dict):
+            raise TypeError(
+                "WhisperX transcription returned "
+                f"{type(result).__name__}, expected a dictionary."
             )
+        if index == 0:
+            detected_language = result.get("language") or language or "en"
+        segments = result.get("segments", [])
+        text = str(result.get("text", "") or "")
+        if not text:
+            text = " ".join(
+                str(seg.get("text", ""))
+                for seg in segments
+                if isinstance(seg, dict)
+            ).strip()
+        if index == 0:
+            opening_text = text
+        raw_windows.append((label, start, chunk, {"segments": segments, "text": text}))
 
-    return audio_words, full_duration, transcription_text, detected_language
+    align_model = None
+    metadata = None
+    if any(data["segments"] for _, _, _, data in raw_windows):
+        align_model, metadata = whisperx.load_align_model(
+            language_code=detected_language,
+            device=device,
+        )
 
+    aligned_words: dict[str, list[AudioWord]] = {}
+    for label, offset, chunk, data in raw_windows:
+        audio_words: list[AudioWord] = []
+        segments = data["segments"]
+        if segments and align_model is not None:
+            aligned_result = whisperx.align(
+                segments,
+                align_model,
+                metadata,
+                chunk,
+                device,
+                return_char_alignments=False,
+            )
+            # Some versions return (aligned_result, metadata); others return only it.
+            if isinstance(aligned_result, tuple):
+                aligned_result = aligned_result[0]
+            if not isinstance(aligned_result, dict):
+                raise TypeError(
+                    "WhisperX alignment returned "
+                    f"{type(aligned_result).__name__}, expected a dictionary."
+                )
+
+            for segment in aligned_result.get("segments", []):
+                if not isinstance(segment, dict):
+                    continue
+                for item in segment.get("words", []):
+                    if not isinstance(item, dict):
+                        continue
+                    word = str(item.get("word", "")).strip()
+                    start = item.get("start")
+                    end = item.get("end")
+                    if not word or start is None or end is None:
+                        continue
+                    try:
+                        start = float(start) + offset
+                        end = float(end) + offset
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(start) or not math.isfinite(end):
+                        continue
+                    audio_words.append(
+                        AudioWord(
+                            text=word,
+                            start=start,
+                            end=end,
+                            index=len(audio_words),
+                        )
+                    )
+        aligned_words[label] = audio_words
+
+    return (
+        aligned_words.get("opening", []),
+        full_duration,
+        opening_text,
+        detected_language,
+        aligned_words,
+    )
+
+
+def estimate_bpm_from_samples(
+    samples: list[BpmSample],
+    current_bpm: float,
+) -> tuple[Optional[float], Optional[float], str, str]:
+    """Robustly estimate BPM from the slope of audio-vs-chart timing offsets."""
+    usable = [
+        sample for sample in samples
+        if sample.match_count >= 3 and sample.spread_ms <= 1200
+    ]
+    if len(usable) < 3:
+        return (
+            None, None, "Low",
+            f"Only {len(usable)} reliable timing samples; at least 3 are needed.",
+        )
+
+    span = max(s.chart_time_seconds for s in usable) - min(
+        s.chart_time_seconds for s in usable
+    )
+    if span < 30.0:
+        return (
+            None, None, "Low",
+            f"Reliable samples span only {span:.1f}s; at least 30s are needed.",
+        )
+
+    # Theil-Sen slope: median of all pairwise offset slopes, robust to one bad sample.
+    slopes = []
+    for i, first in enumerate(usable):
+        for second in usable[i + 1:]:
+            dt = second.chart_time_seconds - first.chart_time_seconds
+            if abs(dt) >= 10.0:
+                slopes.append((second.offset_ms - first.offset_ms) / (dt * 1000.0))
+    if not slopes:
+        return None, None, "Low", "Could not estimate timing drift from the samples."
+
+    slope = statistics.median(slopes)  # seconds of offset drift per chart second
+    denominator = 1.0 + slope
+    if denominator <= 0:
+        return None, None, "Low", "The estimated timing drift is not physically plausible."
+
+    suggested = current_bpm / denominator
+    correction = suggested - current_bpm
+    relative_change = abs(correction) / current_bpm
+    if relative_change > 0.15:
+        return (
+            None, correction, "Low",
+            f"Estimated BPM change {relative_change * 100:.1f}% exceeds the 15% safety limit; review sample matches.",
+        )
+
+    intercept = statistics.median(
+        sample.offset_ms - slope * sample.chart_time_seconds * 1000.0
+        for sample in usable
+    )
+    residuals = [
+        sample.offset_ms - (intercept + slope * sample.chart_time_seconds * 1000.0)
+        for sample in usable
+    ]
+    residual_mad = median_absolute_deviation(residuals)
+
+    if (
+        len(usable) >= 4
+        and all(sample.match_count >= 4 for sample in usable)
+        and residual_mad <= 500
+        and all(sample.spread_ms <= 700 for sample in usable)
+    ):
+        confidence = "High"
+    elif residual_mad <= 1000:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    reason = (
+        f"{len(usable)} reliable samples over {span:.1f}s; "
+        f"timing-drift residual MAD {residual_mad:.0f} ms."
+    )
+    if confidence == "Low":
+        return None, correction, confidence, reason + " The trend is too inconsistent to recommend a BPM change."
+    return suggested, correction, confidence, reason
 
 def local_alignment(
     chart_words: list[ChartWord],
@@ -765,6 +875,20 @@ def evaluate_matches(
     return suggested_gap, correction, confidence, "; ".join(reasons)
 
 
+def summarize_bpm_sample(label: str, matches: list[Match]) -> Optional[BpmSample]:
+    """Summarize a sample using its median timing offset and match spread."""
+    if len(matches) < 3:
+        return None
+    offsets = [match.gap_ms for match in matches]
+    return BpmSample(
+        label=label,
+        chart_time_seconds=statistics.median(m.chart.seconds for m in matches),
+        offset_ms=statistics.median(offsets),
+        match_count=len(matches),
+        spread_ms=median_absolute_deviation(offsets),
+    )
+
+
 def analyze_chart(
     chart_path: Path,
     args: argparse.Namespace,
@@ -819,16 +943,40 @@ def analyze_chart(
         analysis.reason = "No chart lyric words in the opening window."
         return analysis
 
+    # Keep the existing opening transcription for GAP estimation. For BPM
+    # verification, additionally sample three later chart sections; all windows
+    # share one loaded WhisperX model and one alignment model.
+    chart_start = chart_words[0].seconds
+    chart_end = chart_words[-1].seconds
+    chart_span = max(0.0, chart_end - chart_start)
+    sample_window_seconds = 9.0
+    extra_windows: list[tuple[str, float, float]] = []
+    if chart_span >= 45.0:
+        for label, fraction in (("40%", 0.40), ("65%", 0.65), ("90%", 0.90)):
+            center = chart_start + chart_span * fraction
+            audio_start = center + gap_ms / 1000.0 - sample_window_seconds / 2.0
+            # Don't retranscribe audio already covered by the opening window.
+            if audio_start < args.audio_opening_seconds:
+                continue
+            if audio_start < 0:
+                continue
+            extra_windows.append((label, audio_start, sample_window_seconds))
+
     try:
-        audio_words, duration, transcription, detected_language = (
-            transcribe_opening(
-                audio_path=audio_path,
-                model_name=args.model,
-                language=args.language,
-                device=args.device,
-                compute_type=args.compute_type,
-                opening_seconds=args.audio_opening_seconds,
-            )
+        (
+            opening_audio_words,
+            duration,
+            transcription,
+            detected_language,
+            transcribed_windows,
+        ) = transcribe_audio_windows(
+            audio_path=audio_path,
+            model_name=args.model,
+            language=args.language,
+            device=args.device,
+            compute_type=args.compute_type,
+            opening_seconds=args.audio_opening_seconds,
+            extra_windows=extra_windows,
         )
     except Exception as exc:
         analysis.reason = (
@@ -843,16 +991,22 @@ def analyze_chart(
     analysis.transcription = transcription
     analysis.status = "Analysis complete"
 
-    if not audio_words:
+    if not opening_audio_words:
         analysis.reason = (
             f"No aligned audio word timestamps were returned. "
             f"Detected language: {detected_language}."
         )
         return analysis
 
+    # Preserve the existing GAP estimate: align the chart's opening lyrics
+    # against the original opening audio window.
+    opening_chart_words = [
+        word for word in chart_words
+        if word.seconds <= args.chart_opening_seconds
+    ]
     matches = local_alignment(
         opening_chart_words,
-        audio_words,
+        opening_audio_words,
         threshold=args.match_threshold,
     )
     analysis.matches = matches
@@ -868,6 +1022,45 @@ def analyze_chart(
     analysis.correction_ms = correction
     analysis.confidence = confidence
     analysis.reason = reason
+
+    # Beginning sample comes from the existing opening match, limited to the
+    # first 24 chart seconds so it represents one region rather than the whole
+    # opening alignment.
+    if chart_words:
+        beginning_limit = chart_words[0].seconds + 24.0
+        beginning_matches = [m for m in matches if m.chart.seconds <= beginning_limit]
+        beginning_sample = summarize_bpm_sample("Beginning", beginning_matches)
+        bpm_samples: list[BpmSample] = []
+        if beginning_sample:
+            bpm_samples.append(beginning_sample)
+
+        for label, requested_start, requested_duration in extra_windows:
+            sample_audio = transcribed_windows.get(label, [])
+            if not sample_audio:
+                continue
+            center = requested_start - gap_ms / 1000.0 + requested_duration / 2.0
+            chart_window_start = center - requested_duration / 2.0
+            chart_window_end = center + requested_duration / 2.0
+            chart_sample_words = [
+                word for word in chart_words
+                if chart_window_start <= word.seconds <= chart_window_end
+            ]
+            sample_matches = local_alignment(
+                chart_sample_words,
+                sample_audio,
+                threshold=args.match_threshold,
+            )
+            sample = summarize_bpm_sample(label, sample_matches)
+            if sample:
+                bpm_samples.append(sample)
+
+        analysis.bpm_samples = bpm_samples
+        (
+            analysis.suggested_bpm,
+            analysis.bpm_correction,
+            analysis.bpm_confidence,
+            analysis.bpm_reason,
+        ) = estimate_bpm_from_samples(bpm_samples, bpm)
 
     return analysis
 
@@ -888,6 +1081,7 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
         f"Match threshold: {args.match_threshold:.2f}",
         f"Audio opening window: {args.audio_opening_seconds:.1f} seconds",
         f"Chart opening window: {args.chart_opening_seconds:.1f} seconds",
+        "BPM verification samples later sections without transcribing the full song.",
         "",
     ]
 
@@ -923,7 +1117,35 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
         lines.extend([
             f"Confidence: {result.confidence}",
             f"Reason: {result.reason or 'No additional details'}",
+            "",
+            "BPM verification:",
         ])
+        if result.bpm_samples:
+            lines.append("Sample | Chart time | Median offset | Matches | Offset MAD")
+            for sample in result.bpm_samples:
+                lines.append(
+                    f"{sample.label:10} | {sample.chart_time_seconds:8.2f}s | "
+                    f"{sample.offset_ms:+8.0f} ms | {sample.match_count:7d} | "
+                    f"{sample.spread_ms:8.0f} ms"
+                )
+        else:
+            lines.append("No reliable BPM timing samples were available.")
+
+        if result.suggested_bpm is not None and result.bpm_confidence in {"High", "Medium"}:
+            lines.extend([
+                f"Suggested #BPM: {result.suggested_bpm:.3f}",
+                f"BPM correction: {result.bpm_correction:+.3f}",
+                f"BPM confidence: {result.bpm_confidence}",
+                f"BPM assessment: {result.bpm_reason}",
+            ])
+        else:
+            lines.extend([
+                "Suggested #BPM: WITHHELD because the evidence is insufficient.",
+                f"BPM correction (diagnostic only): {result.bpm_correction:+.3f}"
+                if result.bpm_correction is not None else "BPM correction: Not assessed",
+                f"BPM confidence: {result.bpm_confidence}",
+                f"BPM assessment: {result.bpm_reason or 'Not assessed'}",
+            ])
 
         if result.unknown_note_types:
             grouped: dict[str, list[int]] = {}
@@ -990,8 +1212,8 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Estimate UltraStar #GAP values by matching opening chart lyrics "
-            "to WhisperX word timestamps. Source files are never modified."
+            "Estimate UltraStar #GAP values and verify #BPM using sampled "
+            "chart lyrics and WhisperX word timestamps. Source files are never modified."
         )
     )
     parser.add_argument(
