@@ -44,6 +44,9 @@ NOTE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Structural note-line pattern used to flag unsupported note-type markers.
+ANY_NOTE_RE = re.compile(r"^([^\s:#-])\s+-?\d+\s+\d+\s+-?\d+\s+.*$")
+
 NUMBER_RE = r"[+-]?\d+(?:[.,]\d+)?"
 GAP_RE = re.compile(rf"^\s*#GAP:\s*({NUMBER_RE})", re.I)
 BPM_RE = re.compile(rf"^\s*#BPM:\s*({NUMBER_RE})", re.I)
@@ -97,6 +100,7 @@ class Analysis:
     reason: str = ""
     audio_duration: Optional[float] = None
     chart_words: Optional[list[ChartWord]] = None
+    unknown_note_types: Optional[list[tuple[str, int]]] = None
 
 
 def normalize_word(text: str) -> str:
@@ -138,6 +142,25 @@ def word_similarity(a: str, b: str) -> float:
         score = max(score, 0.72)
 
     return min(score, 1.0)
+
+
+def detect_unknown_note_types(path: Path) -> list[tuple[str, int]]:
+    """Find note-shaped lines whose note-type marker is not supported by NOTE_RE.
+
+    Returns (marker, one-based line number) pairs. Player markers such as P1/P2
+    are not treated as note lines because they do not have the note-line fields.
+    """
+    unknown: list[tuple[str, int]] = []
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as f:
+            for line_number, line in enumerate(f, start=1):
+                line = line.rstrip("\r\n")
+                if ANY_NOTE_RE.match(line) and not NOTE_RE.match(line):
+                    marker = line[0]
+                    unknown.append((marker, line_number))
+    except OSError:
+        pass
+    return unknown
 
 
 def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[ChartWord]]:
@@ -747,6 +770,7 @@ def analyze_chart(
     args: argparse.Namespace,
 ) -> Analysis:
     gap_ms, bpm, chart_words = parse_chart(chart_path)
+    unknown_note_types = detect_unknown_note_types(chart_path)
     audio_path = find_audio_for_chart(chart_path)
 
     analysis = Analysis(
@@ -756,6 +780,7 @@ def analyze_chart(
         bpm=bpm,
         status="Analysis failed",
         chart_words=chart_words,
+        unknown_note_types=unknown_note_types,
     )
 
     if bpm is None or bpm <= 0:
@@ -873,7 +898,7 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
             f"Audio: {result.audio_path or 'Not found'}",
             f"Status: {result.status}",
             f"Current #GAP: {format_ms(result.old_gap_ms)}",
-            f"Current BPM: {result.bpm if result.bpm is not None else 'Unknown'}",
+            f"Current #BPM: {result.bpm if result.bpm is not None else 'Unknown'}",
         ])
 
         # Keep the recommendation near the current settings, before diagnostic details.
@@ -899,6 +924,17 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
             f"Confidence: {result.confidence}",
             f"Reason: {result.reason or 'No additional details'}",
         ])
+
+        if result.unknown_note_types:
+            grouped: dict[str, list[int]] = {}
+            for note_type, line_number in result.unknown_note_types:
+                grouped.setdefault(note_type, []).append(line_number)
+            lines.append("Warning: Unknown note type(s) detected; these lines were skipped:")
+            for note_type, line_numbers in sorted(grouped.items()):
+                locations = ", ".join(str(n) for n in line_numbers)
+                lines.append(f"  {note_type!r} at chart line(s): {locations}")
+        else:
+            lines.append("Unknown note types: None detected")
 
         if result.transcription:
             lines.extend([
