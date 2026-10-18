@@ -176,7 +176,7 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
                 continue
 
             # A phrase break ends any unfinished word.
-            if re.match(r"^\s*-\s*-?\d+\s*$", line):
+            if re.match(r"^\s*-\s*-?\d+(?:\s+-?\d+)*\s*$", line):
                 flush_pending_word()
                 continue
 
