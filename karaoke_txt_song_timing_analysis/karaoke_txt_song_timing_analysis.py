@@ -1,22 +1,51 @@
-
 #!/usr/bin/env python3
-"""Read-only UltraStar GAP analysis using opening lyric alignment."""
+"""
+Estimate UltraStar Deluxe #GAP values using WhisperX word timestamps.
+
+Safety:
+- Reads audio and .txt chart files only.
+- Does not modify charts, audio, or other source files.
+- Writes a text report only.
+
+Example:
+    poetry run python ultrastar_gap.py \
+        --source "$HOME/Music/whisper-test" \
+        --report "$HOME/Music/whisper-test/gap_report.txt" \
+        --language en \
+        --model medium \
+        --device cpu \
+        --match-threshold 0.55
+
+The suggested GAP is estimated from:
+    audio word start time - chart note time excluding the existing GAP
+
+A positive correction means increase #GAP; a negative correction means
+decrease #GAP.
+"""
 
 from __future__ import annotations
 
 import argparse
 import difflib
+import math
 import re
+import statistics
 import sys
+import traceback
+
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
-AUDIO_EXTENSIONS = {
-    ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac", ".opus"
-}
 
-# UltraStar note format: : beat duration pitch lyric
-NOTE_RE = re.compile(r"^[:*]\s*(-?\d+)\s+(\d+)\s+(-?\d+)\s+(.*)$")
+NOTE_RE = re.compile(
+    r"^[:*]\s*(-?\d+)\s+(\d+)\s+(-?\d+)\s+(.*)$"
+)
+
+GAP_RE = re.compile(r"^\s*#GAP:\s*(-?\d+(?:\.\d+)?)", re.I)
+BPM_RE = re.compile(r"^\s*#BPM:\s*(-?\d+(?:\.\d+)?)", re.I)
+
+TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?", re.I)
 
 
 @dataclass
@@ -24,6 +53,7 @@ class ChartWord:
     text: str
     beat: float
     seconds: float
+    index: int
 
 
 @dataclass
@@ -31,6 +61,7 @@ class AudioWord:
     text: str
     start: float
     end: float
+    index: int
 
 
 @dataclass
@@ -38,166 +69,162 @@ class Match:
     chart: ChartWord
     audio: AudioWord
     similarity: float
-    offset: float
+    gap_ms: float
+
+    @property
+    def audio_time(self) -> float:
+        return self.audio.start
 
 
-def normalize(text: str) -> str:
-    """Normalize punctuation and UltraStar syllable markers for comparison."""
-    text = text.lower().replace("’", "'").replace("~", "")
-    return "".join(c for c in text if c.isalnum())
+@dataclass
+class Analysis:
+    chart_path: Path
+    audio_path: Optional[Path]
+    old_gap_ms: Optional[float]
+    bpm: Optional[float]
+    status: str
+    transcription: str = ""
+    matches: Optional[list[Match]] = None
+    suggested_gap_ms: Optional[float] = None
+    correction_ms: Optional[float] = None
+    confidence: str = "Not assessed"
+    reason: str = ""
+    audio_duration: Optional[float] = None
+    chart_words: Optional[list[ChartWord]] = None
 
 
-def similarity(a: str, b: str) -> float:
-    """Fuzzy spelling comparison; short common words are deliberately strict."""
-    a, b = normalize(a), normalize(b)
+def normalize_word(text: str) -> str:
+    """Normalize a word for forgiving text comparisons."""
+    return "".join(TOKEN_RE.findall(text.lower()))
+
+
+def tokens(text: str) -> list[str]:
+    return [normalize_word(x) for x in TOKEN_RE.findall(text) if normalize_word(x)]
+
+
+def word_similarity(a: str, b: str) -> float:
+    """
+    Return a permissive similarity score between 0 and 1.
+
+    Exact matches score 1.0. Similar words such as 'antichrist' and
+    'anti-coaster' receive partial credit. Short common words are handled
+    conservatively by the sequence matcher, not treated as strong evidence
+    on their own.
+    """
+    a = normalize_word(a)
+    b = normalize_word(b)
 
     if not a or not b:
         return 0.0
+
     if a == b:
         return 1.0
 
     score = difflib.SequenceMatcher(None, a, b).ratio()
 
-    # Very short words like "I", "a", and "to" are poor fuzzy matches.
-    if min(len(a), len(b)) <= 2:
-        return 0.0
+    # A shared prefix is useful when Whisper changes the end of a sung word.
+    shorter = min(len(a), len(b))
+    if shorter >= 4 and a[:4] == b[:4]:
+        score = max(score, 0.68)
 
-    # Help with ASR variants where one word is a plausible longer form.
-    if a in b or b in a:
-        score = max(score, min(len(a), len(b)) / max(len(a), len(b)))
+    # Common prefixes in the example "anarchist"/"anarchoaster".
+    if shorter >= 5 and a[:5] == b[:5]:
+        score = max(score, 0.72)
 
-    return score
+    return min(score, 1.0)
 
 
-def parse_chart(path: Path):
-    """Read chart timing and reconstruct words from lyric-note boundaries.
-
-    A trailing space in a note's lyric field marks a word boundary in
-    standard UltraStar files. The original lyric field must not be stripped
-    before checking that trailing space.
-    """
-    gap_ms = None
+def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[ChartWord]]:
+    """Read BPM, GAP and lyric words with their chart beat positions."""
     bpm = None
-    relative = False
-    warnings = []
-    notes = []
+    gap_ms = None
+    raw_words: list[tuple[str, float]] = []
 
-    try:
-        lines = path.read_text(
-            encoding="utf-8-sig", errors="replace"
-        ).splitlines()
-    except OSError as exc:
-        return [], None, None, False, [f"Could not read chart: {exc}"]
+    with path.open("r", encoding="utf-8-sig", errors="replace") as f:
+        for line in f:
+            gap_match = GAP_RE.match(line)
+            if gap_match:
+                gap_ms = float(gap_match.group(1))
+                continue
 
-    for line in lines:
-        if line.startswith("#GAP:"):
-            try:
-                gap_ms = float(line.split(":", 1)[1].strip())
-            except ValueError:
-                warnings.append("Invalid #GAP value.")
+            bpm_match = BPM_RE.match(line)
+            if bpm_match:
+                bpm = float(bpm_match.group(1))
+                continue
 
-        elif line.startswith("#BPM:"):
-            try:
-                bpm = float(line.split(":", 1)[1].strip())
-            except ValueError:
-                warnings.append("Invalid #BPM value.")
+            note_match = NOTE_RE.match(line.rstrip("\r\n"))
+            if not note_match:
+                continue
 
-        elif line.upper().startswith("#RELATIVE:"):
-            value = line.split(":", 1)[1].strip().upper()
-            relative = value not in {"NO", "0", "FALSE", ""}
+            beat = int(note_match.group(1))
+            lyric = note_match.group(4)
 
-        else:
-            match = NOTE_RE.match(line)
-            if match:
-                beat = int(match.group(1))
-                raw_lyric = match.group(4)
-                boundary = raw_lyric.endswith(" ")
-                lyric = raw_lyric.strip()
+            # UltraStar commonly uses a trailing space to mark a word end.
+            # Keep the text of each note separate and split note text into
+            # tokens rather than joining the whole song into one string.
+            lyric = lyric.replace("~", " ")
+            for token in tokens(lyric):
+                raw_words.append((token, float(beat)))
 
-                if lyric:
-                    notes.append((beat, lyric, boundary))
-
-    if gap_ms is None:
-        warnings.append("Missing #GAP.")
     if bpm is None or bpm <= 0:
-        warnings.append("Missing or invalid #BPM.")
-    if relative:
-        warnings.append("#RELATIVE chart: skipped.")
+        return gap_ms, bpm, []
 
-    words = []
-
-    if gap_ms is not None and bpm is not None and bpm > 0 and not relative:
-        seconds_per_beat = 60.0 / bpm
-        parts = []
-        first_beat = None
-
-        def flush():
-            nonlocal parts, first_beat
-            if parts and first_beat is not None:
-                word = "".join(parts).replace("~", "")
-                if normalize(word):
-                    words.append(
-                        ChartWord(
-                            text=word,
-                            beat=first_beat,
-                            seconds=gap_ms / 1000.0
-                            + first_beat * seconds_per_beat,
-                        )
-                    )
-            parts = []
-            first_beat = None
-
-        for beat, lyric, boundary in notes:
-            if first_beat is None:
-                first_beat = float(beat)
-
-            # Tilde is a syllable continuation marker, not a word separator.
-            parts.append(lyric.replace("~", ""))
-
-            if boundary:
-                flush()
-
-        flush()
-
-    return words, gap_ms, bpm, relative, warnings
-
-
-def find_audio(chart_path: Path, source: Path):
-    candidates = [
-        p for p in chart_path.parent.iterdir()
-        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+    # The chart beat coordinate is converted using the chart BPM.
+    words = [
+        ChartWord(
+            text=text,
+            beat=beat,
+            seconds=beat * 60.0 / (bpm * 4.0),
+            index=i,
+        )
+        for i, (text, beat) in enumerate(raw_words)
     ]
 
-    exact = [
-        p for p in candidates
-        if p.stem.lower() == chart_path.stem.lower()
-    ]
-    if exact:
-        return exact[0]
+    return gap_ms, bpm, words
 
-    if candidates:
-        candidates.sort(key=lambda p: p.name.lower())
-        return candidates[0]
 
-    for p in source.rglob("*"):
+def find_audio_for_chart(chart_path: Path) -> Optional[Path]:
+    """Find audio with the same basename, case-insensitively."""
+    supported = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".aac", ".opus"}
+
+    for candidate in chart_path.parent.iterdir():
         if (
-            p.is_file()
-            and p.suffix.lower() in AUDIO_EXTENSIONS
-            and p.stem.lower() == chart_path.stem.lower()
+            candidate.is_file()
+            and candidate.stem.casefold() == chart_path.stem.casefold()
+            and candidate.suffix.casefold() in supported
         ):
-            return p
+            return candidate
 
     return None
 
 
+def transcribe_opening(
+    audio_path: Path,
+    model_name: str,
+    language: Optional[str],
+    device: str,
+    compute_type: str,
+    opening_seconds: float,
+) -> tuple[list[AudioWord], float, str, str]:
+    """
+    Transcribe and align the opening section with WhisperX.
 
-def transcribe_opening(whisperx, audio_path, model_name, language,
-                       device, compute_type, opening_seconds):
-    """Transcribe and align only the beginning of the audio."""
+    WhisperX versions differ slightly in return types, so this function
+    validates the returned data and gives a useful error when incompatible.
+    """
+    try:
+        import whisperx
+    except ImportError as exc:
+        raise RuntimeError(
+            "WhisperX is not installed in this Python environment."
+        ) from exc
+
     audio = whisperx.load_audio(str(audio_path))
     sample_rate = 16000
-    duration = len(audio) / sample_rate
-    audio = audio[:int(min(duration, opening_seconds) * sample_rate)]
+    full_duration = len(audio) / sample_rate
+
+    opening_samples = int(min(full_duration, opening_seconds) * sample_rate)
+    audio_opening = audio[:opening_samples]
 
     model = whisperx.load_model(
         model_name,
@@ -207,28 +234,30 @@ def transcribe_opening(whisperx, audio_path, model_name, language,
     )
 
     result = model.transcribe(
-        audio,
+        audio_opening,
         batch_size=4,
         language=language,
     )
 
-    # Some wrappers return a plain string rather than a result dictionary.
-    if isinstance(result, str):
-        raise TypeError(
-            "model.transcribe() returned a string instead of a dictionary: "
-            + repr(result[:200])
-        )
     if not isinstance(result, dict):
         raise TypeError(
-            "Unexpected transcription result type: "
-            + type(result).__name__
+            "WhisperX transcription returned "
+            f"{type(result).__name__}, expected a dictionary."
         )
 
-    detected_language = result.get("language", language)
     segments = result.get("segments", [])
+    detected_language = result.get("language") or language or "en"
+    transcription_text = str(result.get("text", "") or "")
+
+    if not transcription_text:
+        transcription_text = " ".join(
+            str(seg.get("text", ""))
+            for seg in segments
+            if isinstance(seg, dict)
+        ).strip()
 
     if not segments:
-        return [], duration, result.get("text", ""), detected_language
+        return [], full_duration, transcription_text, detected_language
 
     align_model, metadata = whisperx.load_align_model(
         language_code=detected_language,
@@ -239,26 +268,25 @@ def transcribe_opening(whisperx, audio_path, model_name, language,
         segments,
         align_model,
         metadata,
-        audio,
+        audio_opening,
         device,
         return_char_alignments=False,
     )
 
-    # WhisperX normally returns (aligned_result, audio_metadata), but
-    # wrappers or versions may return the result dictionary directly.
+    # Some versions return (aligned_result, metadata); others return only
+    # the aligned result.
     if isinstance(aligned_result, tuple):
-        aligned = aligned_result[0]
-    else:
-        aligned = aligned_result
+        aligned_result = aligned_result[0]
 
-    if not isinstance(aligned, dict):
+    if not isinstance(aligned_result, dict):
         raise TypeError(
-            "whisperx.align() returned unexpected type: "
-            + type(aligned).__name__
+            "WhisperX alignment returned "
+            f"{type(aligned_result).__name__}, expected a dictionary."
         )
 
-    words = []
-    for segment in aligned.get("segments", []):
+    audio_words: list[AudioWord] = []
+
+    for segment in aligned_result.get("segments", []):
         if not isinstance(segment, dict):
             continue
 
@@ -266,97 +294,107 @@ def transcribe_opening(whisperx, audio_path, model_name, language,
             if not isinstance(item, dict):
                 continue
 
-            text = str(item.get("word", "")).strip()
+            word = str(item.get("word", "")).strip()
             start = item.get("start")
             end = item.get("end")
 
-            if text and start is not None and end is not None:
-                words.append(
-                    AudioWord(text, float(start), float(end))
+            if not word or start is None or end is None:
+                continue
+
+            try:
+                start = float(start)
+                end = float(end)
+            except (TypeError, ValueError):
+                continue
+
+            if not math.isfinite(start) or not math.isfinite(end):
+                continue
+
+            audio_words.append(
+                AudioWord(
+                    text=word,
+                    start=start,
+                    end=end,
+                    index=len(audio_words),
                 )
+            )
 
-    transcription_text = result.get("text", "")
-    if not transcription_text:
-        transcription_text = " ".join(
-            str(segment.get("text", ""))
-            for segment in segments
-            if isinstance(segment, dict)
-        ).strip()
-
-    return words, duration, transcription_text, detected_language
+    return audio_words, full_duration, transcription_text, detected_language
 
 
-def local_alignment(chart_words, audio_words):
-    """Find the strongest local, order-preserving sequence of word matches.
-
-    Unlike whole-song matching, this cannot jump to a later audio section:
-    the supplied audio words come only from the opening crop.
+def local_alignment(
+    chart_words: list[ChartWord],
+    audio_words: list[AudioWord],
+    threshold: float,
+    skip_penalty: float = 0.34,
+) -> list[Match]:
     """
-    chart = chart_words[:100]
-    audio = audio_words
-    n, m = len(chart), len(audio)
+    Align chart and ASR words in order using local dynamic programming.
 
-    if not n or not m:
+    The algorithm permits insertions, deletions and imperfect word matches.
+    It seeks a coherent phrase instead of matching a word found anywhere
+    in the full song.
+    """
+    if not chart_words or not audio_words:
         return []
 
-    gap_penalty = -0.65
-    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    n = len(chart_words)
+    m = len(audio_words)
+
+    # Local alignment: a new candidate sequence may begin at any position.
+    scores = [[0.0] * (m + 1) for _ in range(n + 1)]
     trace = [[0] * (m + 1) for _ in range(n + 1)]
 
+    # Directions: 1=diagonal match, 2=skip chart word, 3=skip audio word.
     for i in range(1, n + 1):
+        cw = chart_words[i - 1]
+
         for j in range(1, m + 1):
-            sim = similarity(chart[i - 1].text, audio[j - 1].text)
+            aw = audio_words[j - 1]
+            similarity = word_similarity(cw.text, aw.text)
 
-            # Accept imperfect longer words, but avoid fuzzy matches on
-            # tiny words that occur everywhere.
-            if sim >= 0.50:
-                diagonal = dp[i - 1][j - 1] + (2.0 * sim - 0.45)
-            else:
-                diagonal = dp[i - 1][j - 1] - 0.9
+            # Similarity below threshold is not a positive match, but it can
+            # still be crossed by the alignment to reach later words.
+            match_score = (similarity - threshold) * 2.5
+            diagonal = scores[i - 1][j - 1] + match_score
+            skip_chart = scores[i - 1][j] - skip_penalty
+            skip_audio = scores[i][j - 1] - skip_penalty
 
-            up = dp[i - 1][j] + gap_penalty
-            left = dp[i][j - 1] + gap_penalty
-            best = max(0.0, diagonal, up, left)
+            best = max(0.0, diagonal, skip_chart, skip_audio)
+            scores[i][j] = best
 
-            dp[i][j] = best
-            if best == 0:
+            if best == 0.0:
                 trace[i][j] = 0
             elif best == diagonal:
                 trace[i][j] = 1
-            elif best == up:
+            elif best == skip_chart:
                 trace[i][j] = 2
             else:
                 trace[i][j] = 3
 
-    # Begin traceback at the strongest local-alignment endpoint.
-    best_score = 0.0
-    end_i = end_j = 0
-
+    # Trace back from the best local endpoint.
+    best_i, best_j, best_score = 0, 0, 0.0
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            if dp[i][j] > best_score:
-                best_score = dp[i][j]
-                end_i, end_j = i, j
+            if scores[i][j] > best_score:
+                best_i, best_j, best_score = i, j, scores[i][j]
 
-    matches = []
-    i, j = end_i, end_j
+    pairs: list[tuple[ChartWord, AudioWord, float]] = []
+    i, j = best_i, best_j
 
-    while i > 0 and j > 0 and dp[i][j] > 0:
+    while i > 0 and j > 0 and scores[i][j] > 0:
         direction = trace[i][j]
 
         if direction == 1:
-            sim = similarity(chart[i - 1].text, audio[j - 1].text)
+            cw = chart_words[i - 1]
+            aw = audio_words[j - 1]
+            sim = word_similarity(cw.text, aw.text)
 
-            if sim >= 0.50:
-                cw = chart[i - 1]
-                aw = audio[j - 1]
-                matches.append(
-                    Match(cw, aw, sim, aw.start - cw.seconds)
-                )
+            if sim >= threshold:
+                pairs.append((cw, aw, sim))
 
             i -= 1
             j -= 1
-
         elif direction == 2:
             i -= 1
         elif direction == 3:
@@ -364,319 +402,503 @@ def local_alignment(chart_words, audio_words):
         else:
             break
 
-    matches.reverse()
-    return matches
+    pairs.reverse()
+
+    # A second, deliberately forgiving pass can rescue short opening phrases
+    # where local alignment is broken by a few poor ASR words.
+    #
+    # It greedily searches only forward in audio, preserving word order.
+    if len(pairs) < 4:
+        pairs = greedy_ordered_alignment(chart_words, audio_words, threshold)
+
+    # Remove duplicate or non-monotonic pairs.
+    clean: list[tuple[ChartWord, AudioWord, float]] = []
+    last_chart = -1
+    last_audio = -1
+
+    for cw, aw, sim in pairs:
+        if cw.index > last_chart and aw.index > last_audio:
+            clean.append((cw, aw, sim))
+            last_chart = cw.index
+            last_audio = aw.index
+
+    return [
+        Match(
+            chart=cw,
+            audio=aw,
+            similarity=sim,
+            gap_ms=(aw.start - cw.seconds) * 1000.0,
+        )
+        for cw, aw, sim in clean
+    ]
 
 
-def median(values):
-    values = sorted(values)
+def greedy_ordered_alignment(
+    chart_words: list[ChartWord],
+    audio_words: list[AudioWord],
+    threshold: float,
+) -> list[tuple[ChartWord, AudioWord, float]]:
+    """
+    Forgiving ordered fallback.
+
+    For each chart word, search a small forward window in the ASR words and
+    select the most similar candidate. Short words such as 'I' and 'am' are
+    accepted as supporting matches but are not sufficient on their own.
+    """
+    result = []
+    audio_cursor = 0
+
+    for cw in chart_words:
+        best_index = None
+        best_similarity = 0.0
+
+        # Keep the search local so repeated words later in the song cannot
+        # become an opening match.
+        search_end = min(len(audio_words), audio_cursor + 5)
+
+        for j in range(audio_cursor, search_end):
+            sim = word_similarity(cw.text, audio_words[j].text)
+            if sim > best_similarity:
+                best_similarity = sim
+                best_index = j
+
+        if best_index is None or best_similarity < threshold:
+            continue
+
+        aw = audio_words[best_index]
+        result.append((cw, aw, best_similarity))
+        audio_cursor = best_index + 1
+
+    return result
+
+
+def median_absolute_deviation(values: list[float]) -> float:
     if not values:
-        return 0.0
-    middle = len(values) // 2
-    if len(values) % 2:
-        return values[middle]
-    return (values[middle - 1] + values[middle]) / 2.0
+        return float("inf")
+
+    median = statistics.median(values)
+    return statistics.median(abs(x - median) for x in values)
 
 
-def evaluate(matches, max_correction):
-    """Calculate a robust offset and decide whether it is safe to suggest."""
+def evaluate_matches(
+    matches: list[Match],
+    old_gap_ms: float,
+    threshold: float,
+    max_correction_ms: float,
+) -> tuple[Optional[float], Optional[float], str, str]:
+    """
+    Estimate the new GAP and decide whether the evidence is usable.
+
+    The criteria are intentionally more permissive than the previous script.
+    """
     if not matches:
-        return None, [], 0.0, 0.0, 0.0, "No usable ordered matches."
+        return None, None, "Low", "No ordered lyric matches were found."
 
-    offsets = [m.offset for m in matches]
-    center = median(offsets)
-    mad = median([abs(value - center) for value in offsets])
-    threshold = max(1.25, 3.0 * mad)
+    gap_values = [m.gap_ms for m in matches]
+    suggested_gap = statistics.median(gap_values)
+    correction = suggested_gap - old_gap_ms
+    spread = median_absolute_deviation(gap_values)
 
-    inliers = [
-        match for match in matches
-        if abs(match.offset - center) <= threshold
+    strong_matches = [
+        m for m in matches
+        if m.similarity >= max(threshold + 0.12, 0.67)
     ]
 
-    if not inliers:
-        return center, [], mad, 0.0, 0.0, "No consistent timing matches."
+    distinct_phrases = 0
+    if len(matches) >= 2:
+        # A phrase boundary is approximated by a gap in chart timing.
+        for previous, current in zip(matches, matches[1:]):
+            if current.chart.seconds - previous.chart.seconds > 0.65:
+                distinct_phrases += 1
 
-    final_offset = median([m.offset for m in inliers])
-    final_mad = median([
-        abs(m.offset - final_offset) for m in inliers
-    ])
-    span = (
-        inliers[-1].audio.start - inliers[0].audio.start
-        if len(inliers) > 1 else 0.0
+    matched_span = (
+        matches[-1].audio.start - matches[0].audio.start
+        if len(matches) >= 2
+        else 0.0
     )
-    ratio = len(inliers) / len(matches)
 
-    reasons = []
-    if len(inliers) < 5:
-        reasons.append("fewer than 5 consistent matches")
-    if span < 3.0:
-        reasons.append("matches cover less than 3 seconds")
-    if ratio < 0.60:
-        reasons.append("low inlier ratio")
-    if final_mad > 1.25:
-        reasons.append("inconsistent timing offsets")
-    if abs(final_offset) > max_correction:
-        reasons.append("correction exceeds plausibility limit")
-
-    if reasons:
-        confidence = "Low confidence: " + "; ".join(reasons)
-    elif len(inliers) >= 10 and span >= 8.0 and final_mad <= 0.55:
-        confidence = "High confidence (heuristic)"
-    else:
-        confidence = "Medium confidence (heuristic)"
-
-    return final_offset, inliers, final_mad, ratio, span, confidence
-
-
-def build_report(source, language, model, device, results,
-                 opening_seconds, max_correction):
-    lines = [
-        "ULTRASTAR LYRIC-MATCH GAP ANALYSIS",
-        "==================================",
-        f"Source: {source}",
-        f"Language: {language}",
-        f"Model: {model}",
-        f"Device: {device}",
-        f"Charts found: {len(results)}",
-        "",
-        "IMPORTANT:",
-        "- Original audio and chart files are never modified.",
-        "- Only the requested report file is written.",
-        "- Corrections are advisory and never auto-applied.",
-        f"- Only the first {opening_seconds:.1f} seconds are transcribed.",
-        "- Matching is local and order-preserving.",
-        "- A single matching word can never produce a correction.",
-        "- Confidence labels are heuristics, not probabilities.",
-        "- #RELATIVE charts are skipped.",
-        "- This script estimates GAP only, not BPM corrections.",
-        "- Positive correction means increase #GAP; negative means decrease it.",
-        f"- Maximum permitted correction magnitude: {max_correction:.1f} s",
-        "",
+    # Short common words are useful to anchor the sequence, but don't allow
+    # them alone to justify a GAP change.
+    informative_matches = [
+        m for m in matches
+        if len(normalize_word(m.chart.text)) >= 3
+        or len(normalize_word(m.audio.text)) >= 3
     ]
 
-    for r in results:
-        lines.extend([
-            "-" * 72,
-            f"Chart: {r['chart']}",
-            f"Audio: {r.get('audio') or 'NOT FOUND'}",
-        ])
-
-        for warning in r.get("warnings", []):
-            lines.append(f"Warning: {warning}")
-
-        lines.append(
-            "Chart opening words: "
-            + " ".join(w.text for w in r.get("chart_words", [])[:35])
+    if len(matches) < 3:
+        return (
+            suggested_gap,
+            correction,
+            "Low",
+            f"Only {len(matches)} ordered matches; at least 3 are needed.",
         )
 
-        if "audio_text" in r:
-            lines.append("Recognized opening transcription: " + r["audio_text"])
-            lines.append(
-                f"Recognized aligned word count: {len(r.get('audio_words', []))}"
+    if len(informative_matches) < 2:
+        return (
+            suggested_gap,
+            correction,
+            "Low",
+            "Too few informative word matches; short common words alone "
+            "are not enough.",
+        )
+
+    if spread > 1500:
+        return (
+            suggested_gap,
+            correction,
+            "Low",
+            f"Match timing is inconsistent (median absolute deviation "
+            f"{spread:.0f} ms).",
+        )
+
+    if abs(correction) > max_correction_ms:
+        return (
+            suggested_gap,
+            correction,
+            "Low",
+            f"Proposed correction {correction:+.0f} ms exceeds the allowed "
+            f"limit of {max_correction_ms:.0f} ms.",
+        )
+
+    # Lower confidence is expected for fuzzy singing recognition. The
+    # threshold is intentionally not a hard veto once sequence/timing agree.
+    if len(matches) >= 5 and spread <= 600 and len(strong_matches) >= 2:
+        confidence = "High"
+    elif len(matches) >= 3 and spread <= 1000:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    reasons = [
+        f"{len(matches)} ordered matches",
+        f"{len(strong_matches)} stronger matches",
+        f"timing MAD {spread:.0f} ms",
+    ]
+    if distinct_phrases:
+        reasons.append(f"{distinct_phrases} possible phrase boundaries")
+    if matched_span:
+        reasons.append(f"{matched_span:.2f}s audio span")
+
+    return suggested_gap, correction, confidence, "; ".join(reasons)
+
+
+def analyze_chart(
+    chart_path: Path,
+    args: argparse.Namespace,
+) -> Analysis:
+    gap_ms, bpm, chart_words = parse_chart(chart_path)
+    audio_path = find_audio_for_chart(chart_path)
+
+    analysis = Analysis(
+        chart_path=chart_path,
+        audio_path=audio_path,
+        old_gap_ms=gap_ms,
+        bpm=bpm,
+        status="Analysis failed",
+        chart_words=chart_words,
+    )
+
+    if bpm is None or bpm <= 0:
+        analysis.reason = "Missing or invalid #BPM."
+        return analysis
+
+    if gap_ms is None:
+        analysis.reason = "Missing #GAP."
+        return analysis
+
+    if not chart_words:
+        analysis.reason = "No lyric words with valid note timings were found."
+        return analysis
+
+    if audio_path is None:
+        analysis.reason = "No audio file with the same basename was found."
+        return analysis
+
+    # Restrict matching to the opening lyrics. Do not search the entire song
+    # for a convenient but unrelated word.
+    opening_chart_words = [
+        word for word in chart_words
+        if word.seconds <= args.chart_opening_seconds
+    ]
+
+    if not opening_chart_words:
+        analysis.reason = "No chart lyric words in the opening window."
+        return analysis
+
+    try:
+        audio_words, duration, transcription, detected_language = (
+            transcribe_opening(
+                audio_path=audio_path,
+                model_name=args.model,
+                language=args.language,
+                device=args.device,
+                compute_type=args.compute_type,
+                opening_seconds=args.audio_opening_seconds,
             )
+        )
+    except Exception as exc:
+        analysis.reason = (
+            f"{type(exc).__name__}: {exc}\n"
+            "Run again with --debug for the traceback."
+        )
+        if args.debug:
+            analysis.reason += "\n" + traceback.format_exc()
+        return analysis
 
-        if r.get("gap_ms") is not None:
-            lines.append(f"Current #GAP: {r['gap_ms']:.1f} ms")
-        if r.get("bpm") is not None:
-            lines.append(f"#BPM: {r['bpm']:.3f}")
-        if r.get("status"):
-            lines.append("Status: " + r["status"])
+    analysis.audio_duration = duration
+    analysis.transcription = transcription
+    analysis.status = "Analysis complete"
 
-        matches = r.get("matches", [])
-        lines.append(f"Ordered lyric matches: {len(matches)}")
+    if not audio_words:
+        analysis.reason = (
+            f"No aligned audio word timestamps were returned. "
+            f"Detected language: {detected_language}."
+        )
+        return analysis
 
-        if r.get("offset") is not None:
-            lines.append(f"Median offset: {r['offset']:+.3f} s")
-            lines.append(f"MAD: {r.get('mad', 0.0):.3f} s")
-            lines.append(
-                f"Consistent matches: {len(r.get('inliers', []))} / {len(matches)}"
-            )
-            lines.append(f"Inlier audio span: {r.get('span', 0.0):.1f} s")
-            lines.append(f"Inlier ratio: {r.get('ratio', 0.0):.1%}")
+    matches = local_alignment(
+        opening_chart_words,
+        audio_words,
+        threshold=args.match_threshold,
+    )
+    analysis.matches = matches
 
-        if matches:
-            lines.append("Matched words (chart -> audio):")
-            for m in matches[:35]:
+    suggested, correction, confidence, reason = evaluate_matches(
+        matches,
+        old_gap_ms=gap_ms,
+        threshold=args.match_threshold,
+        max_correction_ms=args.max_correction_ms,
+    )
+
+    analysis.suggested_gap_ms = suggested
+    analysis.correction_ms = correction
+    analysis.confidence = confidence
+    analysis.reason = reason
+
+    return analysis
+
+
+def format_ms(value: Optional[float]) -> str:
+    if value is None:
+        return "Not assessed"
+    return f"{value:.0f} ms"
+
+
+def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
+    lines = [
+        "UltraStar GAP Analysis Report",
+        "=" * 78,
+        "",
+        "Safety: source audio and chart files were read only.",
+        f"Match threshold: {args.match_threshold:.2f}",
+        f"Audio opening window: {args.audio_opening_seconds:.1f} seconds",
+        f"Chart opening window: {args.chart_opening_seconds:.1f} seconds",
+        "",
+    ]
+
+    for result in results:
+        lines.extend([
+            "-" * 78,
+            f"Chart: {result.chart_path}",
+            f"Audio: {result.audio_path or 'Not found'}",
+            f"Status: {result.status}",
+            f"Current #GAP: {format_ms(result.old_gap_ms)}",
+            f"#BPM: {result.bpm if result.bpm is not None else 'Unknown'}",
+            f"Confidence: {result.confidence}",
+            f"Reason: {result.reason or 'No additional details'}",
+        ])
+
+        if result.transcription:
+            lines.extend([
+                "",
+                "Whisper transcription (opening):",
+                result.transcription,
+            ])
+
+        if result.matches:
+            lines.extend([
+                "",
+                "Ordered lyric matches:",
+                "Chart word | Audio word | Similarity | Chart time | "
+                "Audio time | GAP estimate",
+            ])
+
+            for match in result.matches:
                 lines.append(
-                    f"  {m.chart.text} -> {m.audio.text}: "
-                    f"chart {m.chart.seconds:.3f}s, "
-                    f"audio {m.audio.start:.3f}s, "
-                    f"offset {m.offset:+.3f}s, "
-                    f"similarity {m.similarity:.2f}"
+                    f"{match.chart.text:12} | "
+                    f"{match.audio.text:16} | "
+                    f"{match.similarity:5.2f} | "
+                    f"{match.chart.seconds:8.3f}s | "
+                    f"{match.audio.start:8.3f}s | "
+                    f"{match.gap_ms:8.0f} ms"
                 )
 
-        if r.get("correction_ms") is not None:
-            lines.append(f"Provisional GAP correction: {r['correction_ms']:+.0f} ms")
-            lines.append(f"Suggested #GAP: {r['suggested_gap_ms']:.0f} ms")
+        # Never claim that a correction is safe just because a number exists.
+        if (
+            result.suggested_gap_ms is not None
+            and result.correction_ms is not None
+            and result.confidence in {"High", "Medium"}
+        ):
+            lines.extend([
+                "",
+                f"Suggested #GAP: {result.suggested_gap_ms:.0f}",
+                f"Correction: {result.correction_ms:+.0f} ms",
+                "Decision: provisional suggestion; review the matches before "
+                "changing the chart.",
+            ])
         else:
-            lines.append(
-                "Suggested #GAP: WITHHELD because confidence is not sufficient"
-            )
+            lines.extend([
+                "",
+                "Suggested #GAP: WITHHELD because the evidence is insufficient.",
+                f"Estimated GAP (diagnostic only): "
+                f"{format_ms(result.suggested_gap_ms)}",
+                f"Estimated correction (diagnostic only): "
+                f"{format_ms(result.correction_ms)}",
+            ])
 
-        lines.append("Confidence: " + r.get("confidence", "Not assessed"))
         lines.append("")
 
     return "\n".join(lines)
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Read-only UltraStar GAP analysis"
+        description=(
+            "Estimate UltraStar #GAP values by matching opening chart lyrics "
+            "to WhisperX word timestamps. Source files are never modified."
+        )
     )
-    parser.add_argument("--source", required=True)
-    parser.add_argument("--report", required=True)
-    parser.add_argument("--language", default="en")
-    parser.add_argument("--model", default="medium")
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--compute-type", default=None)
-    parser.add_argument("--opening-seconds", type=float, default=45.0)
-    parser.add_argument("--max-correction", type=float, default=15.0)
+    parser.add_argument(
+        "--source",
+        required=True,
+        help="Directory containing UltraStar .txt charts and matching audio.",
+    )
+    parser.add_argument(
+        "--report",
+        required=True,
+        help="Path to the text report to create.",
+    )
+    parser.add_argument(
+        "--language",
+        default="en",
+        help="WhisperX language code (default: en).",
+    )
+    parser.add_argument(
+        "--model",
+        default="medium",
+        help="WhisperX model name (default: medium).",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        choices=("cpu", "cuda"),
+        help="Inference device (default: cpu).",
+    )
+    parser.add_argument(
+        "--compute-type",
+        default=None,
+        help="WhisperX compute type; defaults to int8 on CPU and float16 on CUDA.",
+    )
+    parser.add_argument(
+        "--match-threshold",
+        type=float,
+        default=0.55,
+        help=(
+            "Minimum fuzzy word similarity from 0 to 1. Lower is more "
+            "permissive; default: 0.55."
+        ),
+    )
+    parser.add_argument(
+        "--audio-opening-seconds",
+        type=float,
+        default=45.0,
+        help="How many seconds of audio to transcribe (default: 45).",
+    )
+    parser.add_argument(
+        "--chart-opening-seconds",
+        type=float,
+        default=45.0,
+        help="How far into chart timing to consider opening lyrics (default: 45).",
+    )
+    parser.add_argument(
+        "--max-correction-ms",
+        type=float,
+        default=15000.0,
+        help="Withhold suggestions exceeding this correction (default: 15000).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Include full exception tracebacks in the report.",
+    )
+
     args = parser.parse_args()
+
+    if not 0.0 <= args.match_threshold <= 1.0:
+        parser.error("--match-threshold must be between 0 and 1.")
+
+    if args.audio_opening_seconds <= 0 or args.chart_opening_seconds <= 0:
+        parser.error("Opening windows must be greater than zero.")
+
+    if args.max_correction_ms < 0:
+        parser.error("--max-correction-ms cannot be negative.")
+
+    if args.compute_type is None:
+        args.compute_type = "int8" if args.device == "cpu" else "float16"
 
     source = Path(args.source).expanduser().resolve()
     report_path = Path(args.report).expanduser().resolve()
 
     if not source.is_dir():
-        print(f"Source directory does not exist: {source}", file=sys.stderr)
-        return 2
-    if args.opening_seconds <= 0 or args.max_correction <= 0:
-        print("Opening duration and maximum correction must be positive.", file=sys.stderr)
+        print(f"Error: source directory does not exist: {source}", file=sys.stderr)
         return 2
 
-    charts = []
-    for p in sorted(source.rglob("*.txt")):
-        if p.resolve() == report_path:
-            continue
+    # Avoid accidentally overwriting a chart or audio file with the report.
+    if report_path.suffix.lower() in {
+        ".txt", ".m4a", ".mp3", ".wav", ".flac", ".ogg", ".aac", ".opus"
+    } and report_path.exists():
         try:
-            first_lines = p.read_text(
-                encoding="utf-8-sig", errors="replace"
-            ).splitlines()[:300]
-        except OSError:
-            continue
-
-        if any(
-            line.startswith(("#TITLE:", "#ARTIST:", "#BPM:", "#GAP:"))
-            or NOTE_RE.match(line)
-            for line in first_lines
-        ):
-            charts.append(p)
-
-    compute_type = args.compute_type or (
-        "int8" if args.device == "cpu" else "float16"
-    )
-
-    results = []
-    whisperx = None
-
-    for chart_path in charts:
-        chart_words, gap_ms, bpm, relative, warnings = parse_chart(chart_path)
-
-        item = {
-            "chart": chart_path,
-            "audio": None,
-            "chart_words": chart_words,
-            "gap_ms": gap_ms,
-            "bpm": bpm,
-            "warnings": warnings,
-            "matches": [],
-            "inliers": [],
-            "confidence": "Not assessed",
-        }
-
-        if relative:
-            item["status"] = "Skipped: #RELATIVE chart."
-            results.append(item)
-            continue
-
-        if not chart_words:
-            item["status"] = "Skipped: no parsed lyric words or invalid timing metadata."
-            results.append(item)
-            continue
-
-        if gap_ms is None or bpm is None or bpm <= 0:
-            item["status"] = "Skipped: missing #GAP or valid #BPM."
-            results.append(item)
-            continue
-
-        audio_path = find_audio(chart_path, source)
-        item["audio"] = audio_path
-
-        if audio_path is None:
-            item["status"] = "Skipped: no matching audio file found."
-            results.append(item)
-            continue
-
-        try:
-            if whisperx is None:
-                import whisperx as whisperx_module
-                whisperx = whisperx_module
-
-            audio_words, duration, audio_text, detected_language = (
-                transcribe_opening(
-                    whisperx,
-                    audio_path,
-                    args.model,
-                    args.language,
-                    args.device,
-                    compute_type,
-                    args.opening_seconds,
+            if report_path.resolve().parent == source:
+                print(
+                    "Error: report path points to an existing file inside the "
+                    "source directory. Choose a separate report filename.",
+                    file=sys.stderr,
                 )
-            )
+                return 2
+        except OSError:
+            pass
 
-            item["audio_words"] = audio_words
-            item["audio_text"] = audio_text
-            item["status"] = (
-                f"Opening-only transcription "
-                f"({min(duration, args.opening_seconds):.1f} s); "
-                f"language={detected_language}"
-            )
-
-            # Do not compare lyrics far beyond the audio opening.
-            latest_beat = (
-                args.opening_seconds + args.max_correction
-            ) * bpm / 60.0
-            chart_prefix = [
-                w for w in chart_words if w.beat <= latest_beat
-            ][:100]
-
-            matches = local_alignment(chart_prefix, audio_words)
-            item["matches"] = matches
-
-            offset, inliers, mad, ratio, span, confidence = evaluate(
-                matches, args.max_correction
-            )
-
-            item.update({
-                "offset": offset,
-                "inliers": inliers,
-                "mad": mad,
-                "ratio": ratio,
-                "span": span,
-                "confidence": confidence,
-            })
-
-            if offset is not None and inliers and not confidence.startswith("Low confidence"):
-                item["correction_ms"] = offset * 1000.0
-                item["suggested_gap_ms"] = gap_ms + offset * 1000.0
-            else:
-                item["correction_ms"] = None
-                item["suggested_gap_ms"] = None
-
-        except Exception as exc:
-            item["status"] = f"Analysis failed: {type(exc).__name__}: {exc}"
-            item["confidence"] = "Not assessed"
-
-        results.append(item)
-
-    report = build_report(
-        source,
-        args.language,
-        args.model,
-        args.device,
-        results,
-        args.opening_seconds,
-        args.max_correction,
+    chart_paths = sorted(
+        p for p in source.rglob("*.txt")
+        if p.is_file() and p.resolve() != report_path
     )
+
+    if not chart_paths:
+        print(f"No .txt chart files found under: {source}", file=sys.stderr)
+        return 1
+
+    results: list[Analysis] = []
+
+    for index, chart_path in enumerate(chart_paths, start=1):
+        print(f"[{index}/{len(chart_paths)}] Analyzing: {chart_path}")
+        try:
+            result = analyze_chart(chart_path, args)
+        except Exception as exc:
+            result = Analysis(
+                chart_path=chart_path,
+                audio_path=find_audio_for_chart(chart_path),
+                old_gap_ms=None,
+                bpm=None,
+                status="Analysis failed",
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+            if args.debug:
+                result.reason += "\n" + traceback.format_exc()
+
+        results.append(result)
+        print(f"    {result.status}: {result.confidence}")
+
+    report = format_report(results, args)
 
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -685,8 +907,10 @@ def main():
         print(f"Could not write report: {exc}", file=sys.stderr)
         return 2
 
-    print(report)
-    print(f"\nReport written to: {report_path}")
+    print()
+    print(f"Report written to: {report_path}")
+    print("Audio and chart files were not modified.")
+
     return 0
 
 
