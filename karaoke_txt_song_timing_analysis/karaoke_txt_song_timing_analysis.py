@@ -34,7 +34,7 @@ import statistics
 import sys
 import traceback
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -95,6 +95,18 @@ class BpmSample:
 
 
 @dataclass
+class BpmSampleDiagnostic:
+    label: str
+    audio_start: float
+    audio_end: float
+    chart_words: list[ChartWord]
+    transcription: str
+    aligned_words: list[AudioWord]
+    matches: list[Match]
+    note: str = ""
+
+
+@dataclass
 class Analysis:
     chart_path: Path
     audio_path: Optional[Path]
@@ -115,6 +127,8 @@ class Analysis:
     bpm_correction: Optional[float] = None
     bpm_confidence: str = "Not assessed"
     bpm_reason: str = ""
+    bpm_sample_notes: list[str] = field(default_factory=list)
+    bpm_sample_diagnostics: list[BpmSampleDiagnostic] = field(default_factory=list)
 
 
 def normalize_word(text: str) -> str:
@@ -403,7 +417,14 @@ def transcribe_audio_windows(
     compute_type: str,
     opening_seconds: float,
     extra_windows: list[tuple[str, float, float]],
-) -> tuple[list[AudioWord], float, str, str, dict[str, list[AudioWord]]]:
+) -> tuple[
+    list[AudioWord],
+    float,
+    str,
+    str,
+    dict[str, list[AudioWord]],
+    dict[str, str],
+]:
     """Transcribe the opening plus selected later windows, loading models once.
 
     Extra windows are (label, start_seconds, duration_seconds). Their timestamps
@@ -424,7 +445,8 @@ def transcribe_audio_windows(
 
     windows: list[tuple[str, float, object]] = []
     opening_end = min(full_duration, opening_seconds)
-    windows.append(("opening", 0.0, audio[: int(opening_end * sample_rate)]))
+    if opening_end > 0:
+        windows.append(("opening", 0.0, audio[: int(opening_end * sample_rate)]))
 
     for label, requested_start, requested_duration in extra_windows:
         if requested_duration <= 0 or full_duration <= 0:
@@ -534,6 +556,10 @@ def transcribe_audio_windows(
         opening_text,
         detected_language,
         aligned_words,
+        {
+            label: data["text"]
+            for label, _, _, data in raw_windows
+        },
     )
 
 
@@ -546,10 +572,10 @@ def estimate_bpm_from_samples(
         sample for sample in samples
         if sample.match_count >= 3 and sample.spread_ms <= 1200
     ]
-    if len(usable) < 3:
+    if len(usable) < 2:
         return (
             None, None, "Low",
-            f"Only {len(usable)} reliable timing samples; at least 3 are needed.",
+            f"Only {len(usable)} reliable timing samples; at least 2 are needed.",
         )
 
     span = max(s.chart_time_seconds for s in usable) - min(
@@ -579,12 +605,6 @@ def estimate_bpm_from_samples(
     suggested = current_bpm / denominator
     correction = suggested - current_bpm
     relative_change = abs(correction) / current_bpm
-    if relative_change > 0.15:
-        return (
-            None, correction, "Low",
-            f"Estimated BPM change {relative_change * 100:.1f}% exceeds the 15% safety limit; review sample matches.",
-        )
-
     intercept = statistics.median(
         sample.offset_ms - slope * sample.chart_time_seconds * 1000.0
         for sample in usable
@@ -594,25 +614,40 @@ def estimate_bpm_from_samples(
         for sample in usable
     ]
     residual_mad = median_absolute_deviation(residuals)
+    sample_summary = (
+        f"{len(usable)} reliable samples over {span:.1f}s; "
+        f"timing-drift residual MAD {residual_mad:.0f} ms."
+    )
 
-    if (
+    if relative_change > 0.15:
+        confidence = "Low"
+        reason = (
+            f"Estimated BPM change {relative_change * 100:.1f}% exceeds the "
+            f"15% safety limit; review sample matches. {sample_summary}"
+        )
+    elif len(usable) == 2:
+        confidence = "Low"
+        reason = (
+            f"Only 2 reliable samples over {span:.1f}s; at least 3 are needed "
+            f"for a stronger confidence assessment. {sample_summary}"
+        )
+    elif (
         len(usable) >= 4
         and all(sample.match_count >= 4 for sample in usable)
         and residual_mad <= 500
         and all(sample.spread_ms <= 700 for sample in usable)
     ):
         confidence = "High"
+        reason = sample_summary
     elif residual_mad <= 1000:
         confidence = "Medium"
+        reason = sample_summary
     else:
         confidence = "Low"
+        reason = (
+            f"The timing-drift trend is inconsistent. {sample_summary}"
+        )
 
-    reason = (
-        f"{len(usable)} reliable samples over {span:.1f}s; "
-        f"timing-drift residual MAD {residual_mad:.0f} ms."
-    )
-    if confidence == "Low":
-        return None, correction, confidence, reason + " The trend is too inconsistent to recommend a BPM change."
     return suggested, correction, confidence, reason
 
 def local_alignment(
@@ -889,6 +924,101 @@ def summarize_bpm_sample(label: str, matches: list[Match]) -> Optional[BpmSample
     )
 
 
+def select_bpm_sample_windows(
+    chart_words: list[ChartWord],
+    corrected_gap_ms: float,
+    audio_duration: float,
+    opening_seconds: float,
+    sample_window_seconds: float = 30.0,
+    max_target_distance: float = 10.0,
+) -> tuple[list[tuple[str, float, float]], list[str]]:
+    """Select non-overlapping audio windows centered on lyric clusters."""
+    if len(chart_words) < 3:
+        return [], ["Skipped later samples: fewer than 3 chart lyric words."]
+
+    chart_start = chart_words[0].seconds
+    chart_end = chart_words[-1].seconds
+    chart_span = chart_end - chart_start
+    if chart_span < 45.0:
+        return [], [
+            f"Skipped later samples: lyric timeline spans only "
+            f"{chart_span:.1f}s; at least 45s is required."
+        ]
+
+    clusters: list[list[ChartWord]] = []
+    for word in chart_words:
+        if (
+            not clusters
+            or word.seconds - clusters[-1][-1].seconds > 0.65
+        ):
+            clusters.append([])
+        clusters[-1].append(word)
+
+    gap_seconds = corrected_gap_ms / 1000.0
+    used_windows: list[tuple[float, float]] = []
+    windows: list[tuple[str, float, float]] = []
+    notes: list[str] = []
+
+    for label, fraction in (("50% (middle)", 0.50), ("90% (end)", 0.90)):
+        target_audio_time = chart_start + chart_span * fraction + gap_seconds
+        candidates = []
+
+        for cluster in clusters:
+            anchor = min(
+                cluster,
+                key=lambda word: abs(word.seconds + gap_seconds - target_audio_time),
+            )
+            audio_center = anchor.seconds + gap_seconds
+            distance = abs(audio_center - target_audio_time)
+            audio_start = audio_center - sample_window_seconds / 2.0
+            audio_end = audio_start + sample_window_seconds
+
+            if audio_start < opening_seconds or audio_end > audio_duration:
+                continue
+            if any(
+                min(audio_end, used_end) > max(audio_start, used_start)
+                for used_start, used_end in used_windows
+            ):
+                continue
+
+            candidates.append(
+                (distance, audio_start, anchor.text, anchor.seconds)
+            )
+
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+        if not candidates:
+            notes.append(
+                f"{label}: skipped; no lyric cluster has a full "
+                f"{sample_window_seconds:.0f}s non-overlapping window "
+                "inside the available audio."
+            )
+            continue
+
+        distance, audio_start, lyric, chart_time = next(
+            (candidate for candidate in candidates
+             if candidate[0] <= max_target_distance),
+            candidates[0],
+        )
+        used_windows.append((audio_start, audio_start + sample_window_seconds))
+        windows.append((label, audio_start, sample_window_seconds))
+
+        if distance > max_target_distance:
+            notes.append(
+                f"{label}: using lyric cluster near '{lyric}' "
+                f"at chart {chart_time:.1f}s, "
+                f"{distance:.1f}s from the target (over "
+                f"{max_target_distance:.0f}s)."
+            )
+        else:
+            notes.append(
+                f"{label}: snapped to lyric cluster near '{lyric}' "
+                f"at chart {chart_time:.1f}s, "
+                f"{distance:.1f}s from the target."
+            )
+
+    return windows, notes
+
+
 def analyze_chart(
     chart_path: Path,
     args: argparse.Namespace,
@@ -943,32 +1073,14 @@ def analyze_chart(
         analysis.reason = "No chart lyric words in the opening window."
         return analysis
 
-    # Keep the existing opening transcription for GAP estimation. For BPM
-    # verification, additionally sample three later chart sections; all windows
-    # share one loaded WhisperX model and one alignment model.
-    chart_start = chart_words[0].seconds
-    chart_end = chart_words[-1].seconds
-    chart_span = max(0.0, chart_end - chart_start)
-    sample_window_seconds = 9.0
-    extra_windows: list[tuple[str, float, float]] = []
-    if chart_span >= 45.0:
-        for label, fraction in (("40%", 0.40), ("65%", 0.65), ("90%", 0.90)):
-            center = chart_start + chart_span * fraction
-            audio_start = center + gap_ms / 1000.0 - sample_window_seconds / 2.0
-            # Don't retranscribe audio already covered by the opening window.
-            if audio_start < args.audio_opening_seconds:
-                continue
-            if audio_start < 0:
-                continue
-            extra_windows.append((label, audio_start, sample_window_seconds))
-
     try:
         (
             opening_audio_words,
             duration,
             transcription,
             detected_language,
-            transcribed_windows,
+            _,
+            opening_transcriptions,
         ) = transcribe_audio_windows(
             audio_path=audio_path,
             model_name=args.model,
@@ -976,7 +1088,7 @@ def analyze_chart(
             device=args.device,
             compute_type=args.compute_type,
             opening_seconds=args.audio_opening_seconds,
-            extra_windows=extra_windows,
+            extra_windows=[],
         )
     except Exception as exc:
         analysis.reason = (
@@ -990,13 +1102,6 @@ def analyze_chart(
     analysis.audio_duration = duration
     analysis.transcription = transcription
     analysis.status = "Analysis complete"
-
-    if not opening_audio_words:
-        analysis.reason = (
-            f"No aligned audio word timestamps were returned. "
-            f"Detected language: {detected_language}."
-        )
-        return analysis
 
     # Preserve the existing GAP estimate: align the chart's opening lyrics
     # against the original opening audio window.
@@ -1022,6 +1127,37 @@ def analyze_chart(
     analysis.correction_ms = correction
     analysis.confidence = confidence
     analysis.reason = reason
+    if not opening_audio_words:
+        analysis.reason = (
+            f"No aligned opening audio word timestamps were returned "
+            f"(language: {detected_language}). {reason}"
+        )
+
+    if args.bpm == "off":
+        analysis.bpm_reason = "BPM analysis disabled by --bpm off."
+        return analysis
+
+    gap_for_sampling = suggested if suggested is not None else gap_ms
+    if confidence == "Low":
+        analysis.bpm_sample_notes.append(
+            "GAP confidence is Low; BPM samples will still be attempted. "
+            + (
+                "Using the diagnostic estimated GAP for sample placement."
+                if suggested is not None
+                else "Using the chart's current #GAP for sample placement."
+            )
+        )
+    elif confidence == "Not assessed":
+        analysis.bpm_sample_notes.append(
+            "GAP confidence was not assessed; using the chart's current #GAP "
+            "for sample placement."
+        )
+
+    if not opening_audio_words:
+        analysis.bpm_sample_notes.append(
+            f"No aligned opening audio word timestamps were returned "
+            f"(language: {detected_language}); no Beginning BPM sample is available."
+        )
 
     # Beginning sample comes from the existing opening match, limited to the
     # first 24 chart seconds so it represents one region rather than the whole
@@ -1033,14 +1169,67 @@ def analyze_chart(
         bpm_samples: list[BpmSample] = []
         if beginning_sample:
             bpm_samples.append(beginning_sample)
+        beginning_chart_words = [
+            word for word in chart_words
+            if word.seconds <= beginning_limit
+        ]
+        analysis.bpm_sample_diagnostics.append(
+            BpmSampleDiagnostic(
+                label="Beginning",
+                audio_start=0.0,
+                audio_end=min(duration, args.audio_opening_seconds),
+                chart_words=beginning_chart_words,
+                transcription=opening_transcriptions.get("opening", ""),
+                aligned_words=opening_audio_words,
+                matches=beginning_matches,
+                note=(
+                    ""
+                    if beginning_sample
+                    else "Fewer than 3 matched words; excluded from BPM estimation."
+                ),
+            )
+        )
+
+        extra_windows, selection_notes = select_bpm_sample_windows(
+            chart_words=chart_words,
+            corrected_gap_ms=gap_for_sampling,
+            audio_duration=duration,
+            opening_seconds=args.audio_opening_seconds,
+        )
+        analysis.bpm_sample_notes.extend(selection_notes)
+
+        transcribed_windows: dict[str, list[AudioWord]] = {}
+        sample_transcriptions: dict[str, str] = {}
+        if extra_windows:
+            try:
+                (
+                    _,
+                    _,
+                    _,
+                    _,
+                    transcribed_windows,
+                    sample_transcriptions,
+                ) = transcribe_audio_windows(
+                    audio_path=audio_path,
+                    model_name=args.model,
+                    language=detected_language,
+                    device=args.device,
+                    compute_type=args.compute_type,
+                    opening_seconds=0,
+                    extra_windows=extra_windows,
+                )
+            except Exception as exc:
+                analysis.bpm_sample_notes.append(
+                    f"Later BPM sample transcription failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if args.debug:
+                    analysis.bpm_sample_notes.append(traceback.format_exc())
 
         for label, requested_start, requested_duration in extra_windows:
             sample_audio = transcribed_windows.get(label, [])
-            if not sample_audio:
-                continue
-            center = requested_start - gap_ms / 1000.0 + requested_duration / 2.0
-            chart_window_start = center - requested_duration / 2.0
-            chart_window_end = center + requested_duration / 2.0
+            chart_window_start = requested_start - gap_for_sampling / 1000.0
+            chart_window_end = chart_window_start + requested_duration
             chart_sample_words = [
                 word for word in chart_words
                 if chart_window_start <= word.seconds <= chart_window_end
@@ -1051,8 +1240,28 @@ def analyze_chart(
                 threshold=args.match_threshold,
             )
             sample = summarize_bpm_sample(label, sample_matches)
+            sample_note = ""
             if sample:
                 bpm_samples.append(sample)
+            else:
+                if not sample_audio:
+                    sample_note = "No aligned audio word timestamps were returned."
+                else:
+                    sample_note = "Fewer than 3 ordered lyric matches."
+                analysis.bpm_sample_notes.append(f"{label}: {sample_note}")
+
+            analysis.bpm_sample_diagnostics.append(
+                BpmSampleDiagnostic(
+                    label=label,
+                    audio_start=requested_start,
+                    audio_end=requested_start + requested_duration,
+                    chart_words=chart_sample_words,
+                    transcription=sample_transcriptions.get(label, ""),
+                    aligned_words=sample_audio,
+                    matches=sample_matches,
+                    note=sample_note,
+                )
+            )
 
         analysis.bpm_samples = bpm_samples
         (
@@ -1061,6 +1270,14 @@ def analyze_chart(
             analysis.bpm_confidence,
             analysis.bpm_reason,
         ) = estimate_bpm_from_samples(bpm_samples, bpm)
+        if (
+            confidence in {"Low", "Not assessed"}
+            and analysis.suggested_bpm is not None
+        ):
+            analysis.bpm_confidence = "Low"
+            analysis.bpm_reason += (
+                f" GAP confidence is {confidence}; BPM result is diagnostic only."
+            )
 
     return analysis
 
@@ -1081,7 +1298,7 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
         f"Match threshold: {args.match_threshold:.2f}",
         f"Audio opening window: {args.audio_opening_seconds:.1f} seconds",
         f"Chart opening window: {args.chart_opening_seconds:.1f} seconds",
-        "BPM verification samples later sections without transcribing the full song.",
+        "BPM verification can sample later sections without transcribing the full song.",
         "",
     ]
 
@@ -1117,46 +1334,39 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
         lines.extend([
             f"Confidence: {result.confidence}",
             f"Reason: {result.reason or 'No additional details'}",
-            "",
-            "BPM verification:",
         ])
-        if result.bpm_samples:
-            lines.append("Sample | Chart time | Median offset | Matches | Offset MAD")
-            for sample in result.bpm_samples:
-                lines.append(
-                    f"{sample.label:10} | {sample.chart_time_seconds:8.2f}s | "
-                    f"{sample.offset_ms:+8.0f} ms | {sample.match_count:7d} | "
-                    f"{sample.spread_ms:8.0f} ms"
-                )
-        else:
-            lines.append("No reliable BPM timing samples were available.")
 
-        if result.suggested_bpm is not None and result.bpm_confidence in {"High", "Medium"}:
+        if args.bpm == "off":
+            lines.extend(["BPM verification: Disabled by --bpm off."])
+        elif (
+            result.suggested_bpm is not None
+            and result.bpm_confidence in {"High", "Medium"}
+        ):
             lines.extend([
                 f"Suggested #BPM: {result.suggested_bpm:.3f}",
                 f"BPM correction: {result.bpm_correction:+.3f}",
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason}",
             ])
-        else:
+        elif result.suggested_bpm is not None:
+            lines.extend([
+                f"Estimated #BPM (diagnostic only): {result.suggested_bpm:.3f}",
+                f"BPM correction (diagnostic only): {result.bpm_correction:+.3f}",
+                f"BPM confidence: {result.bpm_confidence}",
+                f"BPM assessment: {result.bpm_reason}",
+            ])
+        elif args.bpm != "off":
             lines.extend([
                 "Suggested #BPM: WITHHELD because the evidence is insufficient.",
-                f"BPM correction (diagnostic only): {result.bpm_correction:+.3f}"
-                if result.bpm_correction is not None else "BPM correction: Not assessed",
+                (
+                    f"BPM correction (diagnostic only): "
+                    f"{result.bpm_correction:+.3f}"
+                    if result.bpm_correction is not None
+                    else "BPM correction: Not assessed"
+                ),
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason or 'Not assessed'}",
             ])
-
-        if result.unknown_note_types:
-            grouped: dict[str, list[int]] = {}
-            for note_type, line_number in result.unknown_note_types:
-                grouped.setdefault(note_type, []).append(line_number)
-            lines.append("Warning: Unknown note type(s) detected; these lines were skipped:")
-            for note_type, line_numbers in sorted(grouped.items()):
-                locations = ", ".join(str(n) for n in line_numbers)
-                lines.append(f"  {note_type!r} at chart line(s): {locations}")
-        else:
-            lines.append("Unknown note types: None detected")
 
         if result.transcription:
             lines.extend([
@@ -1193,6 +1403,88 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
                     f"{match.audio.start:8.3f}s | "
                     f"{match.gap_ms:8.0f} ms"
                 )
+
+        if args.bpm == "off":
+            lines.extend(["", "BPM verification: Disabled by --bpm off."])
+        else:
+            lines.extend(["", "BPM verification:"])
+            if result.bpm_samples:
+                lines.append("Sample | Chart time | Median offset | Matches | Offset MAD")
+                for sample in result.bpm_samples:
+                    lines.append(
+                        f"{sample.label:10} | {sample.chart_time_seconds:8.2f}s | "
+                        f"{sample.offset_ms:+8.0f} ms | {sample.match_count:7d} | "
+                        f"{sample.spread_ms:8.0f} ms"
+                    )
+            else:
+                lines.append("No reliable BPM timing samples were available.")
+
+            if result.bpm_sample_notes:
+                lines.append("BPM sampling notes:")
+                lines.extend(f"  - {note}" for note in result.bpm_sample_notes)
+
+            later_sample_diagnostics = [
+                diagnostic
+                for diagnostic in result.bpm_sample_diagnostics
+                if diagnostic.label != "Beginning"
+            ]
+            if later_sample_diagnostics:
+                lines.extend([
+                    "Beginning BPM sample reuses the opening GAP transcription "
+                    "and matches shown below.",
+                    "Later BPM sample transcription and matching details:",
+                ])
+                for diagnostic in later_sample_diagnostics:
+                    lines.extend([
+                        "",
+                        (
+                            f"{diagnostic.label}: audio "
+                            f"{diagnostic.audio_start:.2f}-{diagnostic.audio_end:.2f}s"
+                        ),
+                        "Chart words: "
+                        + (
+                            " ".join(word.text for word in diagnostic.chart_words)
+                            or "(none in corresponding chart-time window)"
+                        ),
+                        "Whisper transcription: "
+                        + (diagnostic.transcription or "(empty transcription)"),
+                        "Aligned Whisper words: "
+                        + (
+                            " ".join(
+                                f"{word.text} [{word.start:.2f}-{word.end:.2f}s]"
+                                for word in diagnostic.aligned_words
+                            )
+                            or "(none)"
+                        ),
+                    ])
+                    if diagnostic.matches:
+                        lines.extend([
+                            "Matched chart/Whisper words:",
+                            "Chart word | Whisper word | Similarity | "
+                            "Chart time | Audio time | Offset",
+                        ])
+                        for match in diagnostic.matches:
+                            lines.append(
+                                f"{match.chart.text:12} | "
+                                f"{match.audio.text:13} | "
+                                f"{match.similarity:.2f} | "
+                                f"{match.chart.seconds:8.3f}s | "
+                                f"{match.audio.start:8.3f}s | "
+                                f"{match.gap_ms:+8.0f}ms"
+                            )
+                    else:
+                        lines.append("Matched chart/Whisper words: (none)")
+                    if diagnostic.note:
+                        lines.append(f"Sample result: {diagnostic.note}")
+
+        if result.unknown_note_types:
+            grouped: dict[str, list[int]] = {}
+            for note_type, line_number in result.unknown_note_types:
+                grouped.setdefault(note_type, []).append(line_number)
+            lines.append("Warning: Unknown note type(s) detected; these lines were skipped:")
+            for note_type, line_numbers in sorted(grouped.items()):
+                locations = ", ".join(str(n) for n in line_numbers)
+                lines.append(f"  {note_type!r} at chart line(s): {locations}")
 
         if (
             result.suggested_gap_ms is not None
@@ -1273,6 +1565,12 @@ def main() -> int:
         type=float,
         default=15000.0,
         help="Withhold suggestions exceeding this correction (default: 15000).",
+    )
+    parser.add_argument(
+        "--bpm",
+        choices=("on", "off"),
+        default="off",
+        help="Enable or disable BPM analysis (default: off).",
     )
     parser.add_argument(
         "--debug",
