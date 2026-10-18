@@ -873,7 +873,29 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
             f"Audio: {result.audio_path or 'Not found'}",
             f"Status: {result.status}",
             f"Current #GAP: {format_ms(result.old_gap_ms)}",
-            f"#BPM: {result.bpm if result.bpm is not None else 'Unknown'}",
+            f"Current BPM: {result.bpm if result.bpm is not None else 'Unknown'}",
+        ])
+
+        # Keep the recommendation near the current settings, before diagnostic details.
+        if (
+            result.suggested_gap_ms is not None
+            and result.correction_ms is not None
+            and result.confidence in {"High", "Medium"}
+        ):
+            lines.extend([
+                f"Suggested #GAP: {result.suggested_gap_ms:.0f}",
+                f"Correction: {result.correction_ms:+.0f} ms",
+            ])
+        else:
+            lines.extend([
+                "Suggested #GAP: WITHHELD because the evidence is insufficient.",
+                f"Estimated GAP (diagnostic only): "
+                f"{format_ms(result.suggested_gap_ms)}",
+                f"Estimated correction (diagnostic only): "
+                f"{format_ms(result.correction_ms)}",
+            ])
+
+        lines.extend([
             f"Confidence: {result.confidence}",
             f"Reason: {result.reason or 'No additional details'}",
         ])
@@ -914,27 +936,14 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
                     f"{match.gap_ms:8.0f} ms"
                 )
 
-        # Never claim that a correction is safe just because a number exists.
         if (
             result.suggested_gap_ms is not None
             and result.correction_ms is not None
             and result.confidence in {"High", "Medium"}
         ):
             lines.extend([
-                "",
-                f"Suggested #GAP: {result.suggested_gap_ms:.0f}",
-                f"Correction: {result.correction_ms:+.0f} ms",
                 "Decision: provisional suggestion; review the matches before "
                 "changing the chart.",
-            ])
-        else:
-            lines.extend([
-                "",
-                "Suggested #GAP: WITHHELD because the evidence is insufficient.",
-                f"Estimated GAP (diagnostic only): "
-                f"{format_ms(result.suggested_gap_ms)}",
-                f"Estimated correction (diagnostic only): "
-                f"{format_ms(result.correction_ms)}",
             ])
 
         lines.append("")
