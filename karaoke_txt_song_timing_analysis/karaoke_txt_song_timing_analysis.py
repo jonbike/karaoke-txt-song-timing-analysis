@@ -40,7 +40,7 @@ from typing import Optional
 
 
 NOTE_RE = re.compile(
-    r"^([:*FRG])\s*(-?\d+)\s+(\d+)\s+(-?\d+)\s+(.*)$",
+    r"^([:*FRG])\s*(-?\d+)\s+(\d+)\s+(-?\d+)\s(.*)$",
     re.IGNORECASE,
 )
 
@@ -193,11 +193,17 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
                 flush_pending_word()
                 continue
 
-            # Detect the boundary before removing whitespace. Notes such as
-            # "an", "ti", "christ " become the complete word "antichrist".
+            # UltraStar uses an extra leading space in the lyric field to
+            # mark the start of a new word. NOTE_RE consumes only the single
+            # field-separator space, so any additional leading space survives.
+            # Trailing spaces can also mark a word boundary in some charts.
+            starts_word = bool(lyric) and lyric[0].isspace()
             ends_word = bool(lyric) and lyric[-1].isspace()
-            fragment = lyric.strip()
 
+            if starts_word:
+                flush_pending_word()
+
+            fragment = lyric.strip()
             if fragment:
                 if pending_beat is None:
                     pending_beat = float(beat)
