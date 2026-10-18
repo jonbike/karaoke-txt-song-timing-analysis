@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+from datetime import datetime
 import math
 import re
 import statistics
@@ -45,6 +46,7 @@ NOTE_RE = re.compile(
 
 GAP_RE = re.compile(r"^\s*#GAP:\s*(-?\d+(?:\.\d+)?)", re.I)
 BPM_RE = re.compile(r"^\s*#BPM:\s*(-?\d+(?:\.\d+)?)", re.I)
+MP3_RE = re.compile(r"^\s*#MP3:\s*(.*?)\s*$", re.I)
 
 TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?", re.I)
 
@@ -223,9 +225,71 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
     return gap_ms, bpm, words
 
 
+def read_mp3_reference(chart_path: Path) -> Optional[str]:
+    """Read the chart's #MP3 filename, preserving UltraStar's source of truth."""
+    with chart_path.open("r", encoding="utf-8-sig", errors="replace") as f:
+        for line in f:
+            match = MP3_RE.match(line.rstrip("\r\n"))
+            if match:
+                value = match.group(1).strip().strip('"').strip("'").strip()
+                return value or None
+    return None
+
+
+def resolve_case_insensitive(path: Path) -> Optional[Path]:
+    """Resolve a path exactly first, then case-insensitively for Linux systems."""
+    if path.exists() and path.is_file():
+        return path
+
+    # Walk each path component so references with different filename casing
+    # still resolve on case-sensitive filesystems.
+    if path.is_absolute():
+        current = Path(path.anchor)
+        parts = path.parts[1:]
+    else:
+        current = Path.cwd()
+        parts = path.parts
+
+    try:
+        for part in parts:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                current = current.parent
+                continue
+            if not current.is_dir():
+                return None
+            match = next(
+                (child for child in current.iterdir() if child.name.casefold() == part.casefold()),
+                None,
+            )
+            if match is None:
+                return None
+            current = match
+        return current if current.is_file() else None
+    except OSError:
+        return None
+
+
 def find_audio_for_chart(chart_path: Path) -> Optional[Path]:
-    """Find audio with the same basename, case-insensitively."""
+    """Find the audio named by #MP3, relative to the chart's directory.
+
+    If a chart has no #MP3 tag, retain the old same-basename lookup as a
+    compatibility fallback. If #MP3 is present but points to a missing file,
+    do not silently choose a different track.
+    """
     supported = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".aac", ".opus"}
+    mp3_reference = read_mp3_reference(chart_path)
+
+    if mp3_reference:
+        # UltraStar chart references are normally relative to the song folder.
+        # Normalize Windows separators so charts remain portable across OSes.
+        reference = Path(mp3_reference.replace("\\", "/")).expanduser()
+        candidate = reference if reference.is_absolute() else chart_path.parent / reference
+        resolved = resolve_case_insensitive(candidate)
+        if resolved and resolved.suffix.casefold() in supported:
+            return resolved
+        return None
 
     for candidate in chart_path.parent.iterdir():
         if (
@@ -236,6 +300,26 @@ def find_audio_for_chart(chart_path: Path) -> Optional[Path]:
             return candidate
 
     return None
+
+
+def is_existing_ultrastar_chart(path: Path) -> bool:
+    """Protect a chart from being accidentally overwritten as the report."""
+    if not path.is_file() or path.suffix.casefold() != ".txt":
+        return False
+    has_bpm = False
+    has_note = False
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as f:
+            for line in f:
+                if BPM_RE.match(line):
+                    has_bpm = True
+                if NOTE_RE.match(line.rstrip("\r\n")):
+                    has_note = True
+                if has_bpm and has_note:
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def transcribe_opening(
@@ -651,7 +735,15 @@ def analyze_chart(
         return analysis
 
     if audio_path is None:
-        analysis.reason = "No audio file with the same basename was found."
+        mp3_reference = read_mp3_reference(chart_path)
+        if mp3_reference:
+            analysis.reason = (
+                f"No audio file referenced by #MP3 ({mp3_reference!r}) was found."
+            )
+        else:
+            analysis.reason = (
+                "No #MP3 reference or same-basename audio file was found."
+            )
         return analysis
 
     # Restrict matching to the opening lyrics. Do not search the entire song
@@ -728,6 +820,7 @@ def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
     lines = [
         "UltraStar GAP Analysis Report",
         "=" * 78,
+        f"Generated: {datetime.now().astimezone().isoformat(timespec='seconds')}",
         "",
         "Safety: source audio and chart files were read only.",
         f"Match threshold: {args.match_threshold:.2f}",
@@ -893,20 +986,23 @@ def main() -> int:
         print(f"Error: source directory does not exist: {source}", file=sys.stderr)
         return 2
 
-    # Avoid accidentally overwriting a chart or audio file with the report.
-    if report_path.suffix.lower() in {
-        ".txt", ".m4a", ".mp3", ".wav", ".flac", ".ogg", ".aac", ".opus"
-    } and report_path.exists():
-        try:
-            if report_path.resolve().parent == source:
-                print(
-                    "Error: report path points to an existing file inside the "
-                    "source directory. Choose a separate report filename.",
-                    file=sys.stderr,
-                )
-                return 2
-        except OSError:
-            pass
+    # Existing reports may be overwritten, including reports inside the source
+    # tree. Still refuse to overwrite an actual chart or audio file.
+    audio_suffixes = {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".aac", ".opus"}
+    if report_path.exists():
+        if report_path.suffix.casefold() in audio_suffixes:
+            print(
+                "Error: report path points to an audio file; refusing to overwrite it.",
+                file=sys.stderr,
+            )
+            return 2
+        if is_existing_ultrastar_chart(report_path):
+            print(
+                "Error: report path points to an existing UltraStar chart; "
+                "refusing to overwrite it.",
+                file=sys.stderr,
+            )
+            return 2
 
     chart_paths = sorted(
         p for p in source.rglob("*.txt")
