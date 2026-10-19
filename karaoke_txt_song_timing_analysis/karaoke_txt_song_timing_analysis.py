@@ -29,6 +29,7 @@ import argparse
 import difflib
 from datetime import datetime
 import math
+import multiprocessing
 import re
 import statistics
 import sys
@@ -54,7 +55,7 @@ AUDIO_RE = re.compile(r"^\s*#AUDIO:\s*(.*?)\s*$", re.I)
 MP3_RE = re.compile(r"^\s*#MP3:\s*(.*?)\s*$", re.I)
 RELATIVE_RE = re.compile(r"^\s*#RELATIVE:\s*(.*?)\s*$", re.I)
 
-TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?", re.I)
+TOKEN_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)?", re.I)
 
 
 @dataclass
@@ -140,6 +141,18 @@ def tokens(text: str) -> list[str]:
     return [normalize_word(x) for x in TOKEN_RE.findall(text) if normalize_word(x)]
 
 
+def read_chart_text(path: Path) -> str:
+    """Read UTF-8 charts, falling back to legacy Windows-1252 encoding."""
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            return data.decode("cp1252")
+        except UnicodeDecodeError:
+            return data.decode("latin-1")
+
+
 def word_similarity(a: str, b: str) -> float:
     """
     Return a permissive similarity score between 0 and 1.
@@ -180,12 +193,13 @@ def detect_unknown_note_types(path: Path) -> list[tuple[str, int]]:
     """
     unknown: list[tuple[str, int]] = []
     try:
-        with path.open("r", encoding="utf-8-sig", errors="replace") as f:
-            for line_number, line in enumerate(f, start=1):
-                line = line.rstrip("\r\n")
-                if ANY_NOTE_RE.match(line) and not NOTE_RE.match(line):
-                    marker = line[0]
-                    unknown.append((marker, line_number))
+        for line_number, line in enumerate(
+            read_chart_text(path).splitlines(),
+            start=1,
+        ):
+            if ANY_NOTE_RE.match(line) and not NOTE_RE.match(line):
+                marker = line[0]
+                unknown.append((marker, line_number))
     except OSError:
         pass
     return unknown
@@ -219,67 +233,64 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
         pending_text = ""
         pending_beat = None
 
-    with path.open("r", encoding="utf-8-sig", errors="replace") as f:
-        for line in f:
-            # Remove only the line ending. Do not strip lyric trailing spaces:
-            # they carry the word-boundary information.
-            line = line.rstrip("\r\n")
+    for line in read_chart_text(path).splitlines():
+        # Do not strip lyric trailing spaces: they carry word-boundary data.
 
-            relative_match = RELATIVE_RE.match(line)
-            if relative_match:
-                relative_timing = relative_match.group(1).strip().casefold() == "yes"
-                continue
+        relative_match = RELATIVE_RE.match(line)
+        if relative_match:
+            relative_timing = relative_match.group(1).strip().casefold() == "yes"
+            continue
 
-            gap_match = GAP_RE.match(line)
-            if gap_match:
-                gap_ms = parse_number(gap_match.group(1))
-                continue
+        gap_match = GAP_RE.match(line)
+        if gap_match:
+            gap_ms = parse_number(gap_match.group(1))
+            continue
 
-            bpm_match = BPM_RE.match(line)
-            if bpm_match:
-                bpm = parse_number(bpm_match.group(1))
-                continue
+        bpm_match = BPM_RE.match(line)
+        if bpm_match:
+            bpm = parse_number(bpm_match.group(1))
+            continue
 
-            # A phrase break ends any unfinished word. It does not replace the
-            # previous note as the reference for subsequent relative note beats.
-            phrase_match = re.match(r"^\s*-\s*(-?\d+)(?:\s+-?\d+)*\s*$", line)
-            if phrase_match:
-                flush_pending_word()
-                continue
+        # A phrase break ends any unfinished word. It does not replace the
+        # previous note as the reference for subsequent relative note beats.
+        phrase_match = re.match(r"^\s*-\s*(-?\d+)(?:\s+-?\d+)*\s*$", line)
+        if phrase_match:
+            flush_pending_word()
+            continue
 
-            note_match = NOTE_RE.match(line)
-            if not note_match:
-                continue
+        note_match = NOTE_RE.match(line)
+        if not note_match:
+            continue
 
-            encoded_beat = float(int(note_match.group(2)))
-            beat = previous_start_beat + encoded_beat if relative_timing else encoded_beat
-            previous_start_beat = beat
-            lyric = note_match.group(5)
+        encoded_beat = float(int(note_match.group(2)))
+        beat = previous_start_beat + encoded_beat if relative_timing else encoded_beat
+        previous_start_beat = beat
+        lyric = note_match.group(5)
 
-            # A tilde is a note-extension marker, not a sung word. It also
-            # safely closes any pending lyric word before the extension.
-            if lyric.strip() == "~":
-                flush_pending_word()
-                continue
+        # A tilde is a note-extension marker, not a sung word. It also
+        # safely closes any pending lyric word before the extension.
+        if lyric.strip() == "~":
+            flush_pending_word()
+            continue
 
-            # UltraStar uses an extra leading space in the lyric field to
-            # mark the start of a new word. NOTE_RE consumes only the single
-            # field-separator space, so any additional leading space survives.
-            # Trailing spaces can also mark a word boundary in some charts.
-            starts_word = bool(lyric) and lyric[0].isspace()
-            ends_word = bool(lyric) and lyric[-1].isspace()
+        # UltraStar uses an extra leading space in the lyric field to
+        # mark the start of a new word. NOTE_RE consumes only the single
+        # field-separator space, so any additional leading space survives.
+        # Trailing spaces can also mark a word boundary in some charts.
+        starts_word = bool(lyric) and lyric[0].isspace()
+        ends_word = bool(lyric) and lyric[-1].isspace()
 
-            if starts_word:
-                flush_pending_word()
+        if starts_word:
+            flush_pending_word()
 
-            fragment = lyric.strip()
-            if fragment:
-                if pending_beat is None:
-                    pending_beat = float(beat)
-                pending_text += fragment
+        fragment = lyric.strip()
+        if fragment:
+            if pending_beat is None:
+                pending_beat = float(beat)
+            pending_text += fragment
 
-            if ends_word:
-                flush_pending_word()
+        if ends_word:
+            flush_pending_word()
 
     # Don't lose the final word if the file ends without a trailing space.
     flush_pending_word()
@@ -304,18 +315,16 @@ def read_audio_reference(chart_path: Path) -> tuple[Optional[str], Optional[str]
     """Read #AUDIO preferentially, with legacy #MP3 support."""
     audio_value: Optional[str] = None
     mp3_value: Optional[str] = None
-    with chart_path.open("r", encoding="utf-8-sig", errors="replace") as f:
-        for line in f:
-            line = line.rstrip("\r\n")
-            match = AUDIO_RE.match(line)
-            if match and audio_value is None:
-                value = match.group(1).strip().strip('"').strip("'").strip()
-                audio_value = value or None
-                continue
-            match = MP3_RE.match(line)
-            if match and mp3_value is None:
-                value = match.group(1).strip().strip('"').strip("'").strip()
-                mp3_value = value or None
+    for line in read_chart_text(chart_path).splitlines():
+        match = AUDIO_RE.match(line)
+        if match and audio_value is None:
+            value = match.group(1).strip().strip('"').strip("'").strip()
+            audio_value = value or None
+            continue
+        match = MP3_RE.match(line)
+        if match and mp3_value is None:
+            value = match.group(1).strip().strip('"').strip("'").strip()
+            mp3_value = value or None
     if audio_value:
         return "#AUDIO", audio_value
     if mp3_value:
@@ -396,14 +405,13 @@ def is_existing_ultrastar_chart(path: Path) -> bool:
     has_bpm = False
     has_note = False
     try:
-        with path.open("r", encoding="utf-8-sig", errors="replace") as f:
-            for line in f:
-                if BPM_RE.match(line):
-                    has_bpm = True
-                if NOTE_RE.match(line.rstrip("\r\n")):
-                    has_note = True
-                if has_bpm and has_note:
-                    return True
+        for line in read_chart_text(path).splitlines():
+            if BPM_RE.match(line):
+                has_bpm = True
+            if NOTE_RE.match(line):
+                has_note = True
+            if has_bpm and has_note:
+                return True
     except OSError:
         return False
     return False
@@ -439,14 +447,14 @@ def transcribe_audio_windows(
             "WhisperX is not installed in this Python environment."
         ) from exc
 
-    audio = whisperx.load_audio(str(audio_path))
     sample_rate = 16000
+    audio = whisperx.load_audio(str(audio_path))
     full_duration = len(audio) / sample_rate
 
     windows: list[tuple[str, float, object]] = []
     opening_end = min(full_duration, opening_seconds)
     if opening_end > 0:
-        windows.append(("opening", 0.0, audio[: int(opening_end * sample_rate)]))
+        windows.append(("opening", 0.0, audio[:int(opening_end * sample_rate)]))
 
     for label, requested_start, requested_duration in extra_windows:
         if requested_duration <= 0 or full_duration <= 0:
@@ -455,7 +463,13 @@ def transcribe_audio_windows(
         end = min(full_duration, start + requested_duration)
         if end - start < min(3.0, requested_duration * 0.6):
             continue
-        windows.append((label, start, audio[int(start * sample_rate):int(end * sample_rate)]))
+        windows.append(
+            (
+                label,
+                start,
+                audio[int(start * sample_rate):int(end * sample_rate)],
+            )
+        )
 
     model = whisperx.load_model(
         model_name,
@@ -488,7 +502,7 @@ def transcribe_audio_windows(
                 for seg in segments
                 if isinstance(seg, dict)
             ).strip()
-        if index == 0:
+        if label == "opening":
             opening_text = text
         raw_windows.append((label, start, chunk, {"segments": segments, "text": text}))
 
@@ -1282,25 +1296,100 @@ def analyze_chart(
     return analysis
 
 
+def _analyze_chart_worker(connection, chart_path: Path, args: argparse.Namespace) -> None:
+    try:
+        try:
+            result = analyze_chart(chart_path, args)
+        except Exception as exc:
+            result = Analysis(
+                chart_path=chart_path,
+                audio_path=find_audio_for_chart(chart_path),
+                old_gap_ms=None,
+                bpm=None,
+                status="Analysis failed",
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+            if args.debug:
+                result.reason += "\n" + traceback.format_exc()
+        connection.send(result)
+    finally:
+        connection.close()
+
+
+def analyze_chart_in_child_process(
+    chart_path: Path,
+    args: argparse.Namespace,
+) -> Analysis:
+    context = multiprocessing.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_analyze_chart_worker,
+        args=(send_connection, chart_path, args),
+    )
+    try:
+        process.start()
+    except BaseException:
+        receive_connection.close()
+        send_connection.close()
+        raise
+
+    send_connection.close()
+    try:
+        try:
+            result = receive_connection.recv()
+        except EOFError:
+            result = None
+    except BaseException:
+        if process.is_alive():
+            process.terminate()
+        process.join()
+        raise
+    finally:
+        receive_connection.close()
+    process.join()
+
+    if result is None:
+        return Analysis(
+            chart_path=chart_path,
+            audio_path=find_audio_for_chart(chart_path),
+            old_gap_ms=None,
+            bpm=None,
+            status="Analysis failed",
+            reason=(
+                "Per-chart analysis process exited without returning a result "
+                f"(exit code {process.exitcode})."
+            ),
+        )
+    return result
+
+
 def format_ms(value: Optional[float]) -> str:
     if value is None:
         return "Not assessed"
     return f"{value:.0f} ms"
 
 
-def format_report(results: list[Analysis], args: argparse.Namespace) -> str:
+def format_report(
+    results: list[Analysis],
+    args: argparse.Namespace,
+    include_header: bool = True,
+) -> str:
     lines = [
-        "UltraStar GAP Analysis Report",
-        "=" * 78,
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
-        "Safety: source audio and chart files were read only.",
-        f"Match threshold: {args.match_threshold:.2f}",
-        f"Audio opening window: {args.audio_opening_seconds:.1f} seconds",
-        f"Chart opening window: {args.chart_opening_seconds:.1f} seconds",
-        "BPM verification can sample later sections without transcribing the full song.",
-        "",
     ]
+
+    if include_header:
+        lines.extend([
+            "UltraStar GAP Analysis Report",
+            "=" * 78,
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "Safety: source audio and chart files were read only.",
+            f"Match threshold: {args.match_threshold:.2f}",
+            f"Audio opening window: {args.audio_opening_seconds:.1f} seconds",
+            f"Chart opening window: {args.chart_opening_seconds:.1f} seconds",
+            "BPM verification can sample later sections without transcribing the full song.",
+            "",
+        ])
 
     for result in results:
         lines.extend([
@@ -1626,32 +1715,32 @@ def main() -> int:
         print(f"No .txt chart files found under: {source}", file=sys.stderr)
         return 1
 
-    results: list[Analysis] = []
-
-    for index, chart_path in enumerate(chart_paths, start=1):
-        print(f"[{index}/{len(chart_paths)}] Analyzing: {chart_path}")
-        try:
-            result = analyze_chart(chart_path, args)
-        except Exception as exc:
-            result = Analysis(
-                chart_path=chart_path,
-                audio_path=find_audio_for_chart(chart_path),
-                old_gap_ms=None,
-                bpm=None,
-                status="Analysis failed",
-                reason=f"{type(exc).__name__}: {exc}",
-            )
-            if args.debug:
-                result.reason += "\n" + traceback.format_exc()
-
-        results.append(result)
-        print(f"    {result.status}: {result.confidence}")
-
-    report = format_report(results, args)
-
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(report, encoding="utf-8")
+        with report_path.open("w", encoding="utf-8") as report_file:
+            report_file.write(format_report([], args))
+            for index, chart_path in enumerate(chart_paths, start=1):
+                print(f"[{index}/{len(chart_paths)}] Analyzing: {chart_path}")
+                try:
+                    result = analyze_chart_in_child_process(chart_path, args)
+                except Exception as exc:
+                    result = Analysis(
+                        chart_path=chart_path,
+                        audio_path=find_audio_for_chart(chart_path),
+                        old_gap_ms=None,
+                        bpm=None,
+                        status="Analysis failed",
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
+                    if args.debug:
+                        result.reason += "\n" + traceback.format_exc()
+
+                report_file.write(
+                    format_report([result], args, include_header=False)
+                )
+                report_file.flush()
+                print(f"    {result.status}: {result.confidence}")
+                del result
     except OSError as exc:
         print(f"Could not write report: {exc}", file=sys.stderr)
         return 2
