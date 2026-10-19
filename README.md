@@ -63,12 +63,18 @@ details, and any reason a suggestion was withheld or a chart could not be
 analyzed. The command also prints progress and the report location to the
 terminal.
 
+Use `--report-level summary` to write only the key settings and per-chart
+results. The default `--report-level all` keeps the detailed report. When
+`--write-gap` is enabled, either report level includes the result of each
+chart's `#GAP` write attempt.
+
 ## Options
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `--source` | Required | Directory containing charts and matching audio. |
 | `--report` | Required | Text report path; an existing report at this path is overwritten. |
+| `--report-level` | `all` | Report detail level: `all` for full diagnostics or `summary` for key results. |
 | `--language` | `en` | WhisperX language code, such as `de` for German. |
 | `--model` | `medium` | WhisperX model name. |
 | `--device` | `cpu` | Inference device: `cpu` or `cuda`. |
@@ -87,7 +93,7 @@ Without `--write-gap`, chart and audio files are read only. With
 `--write-gap`, a chart is updated only when the GAP estimate has Medium or High
 confidence, is finite, and differs from the current value by at least 100 ms.
 Before changing a chart, the tool refreshes a sibling backup named
-`<chart>.txt.bak` (for example, `song.txt.bak`). Audio files are never
+`<chart-stem>.bak` (for example, `song.bak` for `song.txt`). Audio files are never
 modified. Review the report and keep backups before enabling chart updates.
 
 ## Limitations

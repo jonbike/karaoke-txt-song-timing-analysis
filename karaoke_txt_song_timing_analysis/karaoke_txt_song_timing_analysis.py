@@ -1433,7 +1433,7 @@ def write_gap_update(result: Analysis) -> str:
     )
     lines[line_index] = updated_line
     updated = b"".join(lines)
-    backup_path = chart_path.with_name(chart_path.name + ".bak")
+    backup_path = chart_path.with_suffix(".bak")
     if backup_path.is_symlink():
         return "Failed to update chart: refusing to overwrite a symbolic-link backup."
     temporary_path: Optional[Path] = None
@@ -1495,11 +1495,71 @@ def format_ms(value: Optional[float]) -> str:
     return f"{value:.0f} ms"
 
 
+def format_summary_report(
+    results: list[Analysis],
+    args: argparse.Namespace,
+    include_header: bool = True,
+) -> str:
+    lines = []
+
+    if include_header:
+        lines.extend([
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            f"Match threshold: {args.match_threshold:.2f}",
+            f"Audio opening window: {args.audio_opening_seconds:.1f} seconds",
+            f"Chart opening window: {args.chart_opening_seconds:.1f} seconds",
+            "",
+        ])
+
+    for result in results:
+        lines.extend([
+            "-" * 78,
+            f"Chart: {result.chart_path}",
+            f"Audio: {result.audio_path or 'Not found'}",
+            f"Status: {result.status}",
+            f"Current #GAP: {format_ms(result.old_gap_ms)}",
+            f"Current #BPM: {result.bpm:.1f}" if result.bpm is not None else "Current #BPM: Unknown",
+        ])
+
+        if (
+            result.suggested_gap_ms is not None
+            and result.correction_ms is not None
+            and result.confidence in {"High", "Medium"}
+        ):
+            lines.extend([
+                f"Suggested #GAP: {result.suggested_gap_ms:.0f}",
+                f"Correction: {result.correction_ms:+.0f} ms",
+            ])
+        else:
+            lines.extend([
+                "Suggested #GAP: Withheld",
+                (
+                    f"Correction: {result.correction_ms:+.0f} ms (diagnostic only)"
+                    if result.correction_ms is not None
+                    else "Correction: Not assessed"
+                ),
+            ])
+
+        lines.extend([
+            f"Confidence: {result.confidence}",
+            f"Reason: {(result.reason or 'No additional details').splitlines()[0]}",
+        ])
+        if args.write_gap:
+            lines.append(f"#GAP write: {result.gap_write_status}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def format_report(
     results: list[Analysis],
     args: argparse.Namespace,
     include_header: bool = True,
 ) -> str:
+    if args.report_level == "summary":
+        return format_summary_report(results, args, include_header)
+
     lines = [
     ]
 
@@ -1743,6 +1803,12 @@ def main() -> int:
         help="Path to the text report to create.",
     )
     parser.add_argument(
+        "--report-level",
+        choices=("all", "summary"),
+        default="all",
+        help="Report detail level: all (default) or summary.",
+    )
+    parser.add_argument(
         "--language",
         default="en",
         help="WhisperX language code (default: en).",
@@ -1801,7 +1867,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Update chart #GAP values when confidence is Medium or High; "
-            "refresh a .txt.bak backup first."
+            "refresh a sibling .bak backup first."
         ),
     )
     parser.add_argument(
