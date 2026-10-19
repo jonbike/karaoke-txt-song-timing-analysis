@@ -80,8 +80,8 @@ chart's `#GAP` write attempt.
 | `--device` | `cpu` | Inference device: `cpu` or `cuda`. |
 | `--compute-type` | Device-dependent | WhisperX compute type; defaults to `int8` on CPU and `float16` on CUDA. |
 | `--match-threshold` | `0.55` | Minimum fuzzy word similarity from 0 to 1. Lower values allow less-exact matches. |
-| `--audio-opening-seconds` | `45` | Length of the opening audio window to transcribe. |
-| `--chart-opening-seconds` | `45` | Maximum chart time considered for opening lyrics. |
+| `--audio-opening-seconds` | `60` | Length of the opening audio window to transcribe. |
+| `--chart-opening-seconds` | `60` | Maximum chart time considered for opening lyrics. |
 | `--max-correction-ms` | `15000` | Maximum correction allowed for a GAP suggestion. |
 | `--bpm` | `off` | Set to `on` to enable BPM analysis using sampled song sections. |
 | `--write-gap` | Off | Update charts when a GAP suggestion is eligible. |

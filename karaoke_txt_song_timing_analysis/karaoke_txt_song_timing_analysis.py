@@ -1841,14 +1841,14 @@ def main() -> int:
     parser.add_argument(
         "--audio-opening-seconds",
         type=float,
-        default=45.0,
-        help="How many seconds of audio to transcribe (default: 45).",
+        default=60.0,
+        help="How many seconds of audio to transcribe (default: 60).",
     )
     parser.add_argument(
         "--chart-opening-seconds",
         type=float,
-        default=45.0,
-        help="How far into chart timing to consider opening lyrics (default: 45).",
+        default=60.0,
+        help="How far into chart timing to consider opening lyrics (default: 60).",
     )
     parser.add_argument(
         "--max-correction-ms",
