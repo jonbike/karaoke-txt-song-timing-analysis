@@ -48,14 +48,17 @@ a supported audio file.
 Run the analysis from the repository root. For example:
 
 ```sh
-poetry run python karaoke_txt_song_timing_analysis/karaoke_txt_song_timing_analysis.py --source "~/Music/Testing" --report "~/Music/gap_report.txt" --language de --model small --device cpu --match-threshold 0.55 --write-gap
+poetry run python karaoke_txt_song_timing_analysis/karaoke_txt_song_timing_analysis.py --source "~/Music/Testing" --report "~/Music/gap_report.txt" --model small --device cpu --match-threshold 0.55 --write-gap
 ```
 
 This scans `~/Music/Testing` and its subdirectories, analyzes charts using the
-German WhisperX model `small` on the CPU, and writes the report to
-`~/Music/gap_report.txt`. The quoted home-directory paths are expanded by the
-program. In this example, `--write-gap` also enables eligible chart updates;
-omit it to produce a report without changing chart files.
+WhisperX model `small` on the CPU with automatic language detection, and writes
+the report to `~/Music/gap_report.txt`. The quoted home-directory paths are
+expanded by the program. In this example, `--write-gap` also enables eligible
+chart updates; omit it to produce a report without changing chart files.
+
+To specify a language instead of using automatic detection, pass a WhisperX
+language code, for example `--language de` for German.
 
 The report is created or overwritten at the path given by `--report`. It
 includes each chart's current and suggested `#GAP`, match confidence, analysis
@@ -75,7 +78,7 @@ chart's `#GAP` write attempt.
 | `--source` | Required | Directory containing charts and matching audio. |
 | `--report` | Required | Text report path; an existing report at this path is overwritten. |
 | `--report-level` | `all` | Report detail level: `all` for full diagnostics or `summary` for key results. |
-| `--language` | `en` | WhisperX language code, such as `de` for German. |
+| `--language` | Automatic detection | WhisperX language code, such as `de` for German. |
 | `--model` | `medium` | WhisperX model name. |
 | `--device` | `cpu` | Inference device: `cpu` or `cuda`. |
 | `--compute-type` | Device-dependent | WhisperX compute type; defaults to `int8` on CPU and `float16` on CUDA. |

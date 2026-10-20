@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import difflib
 from datetime import datetime
+from importlib.metadata import version
 import math
 import multiprocessing
 import os
@@ -42,6 +43,9 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+VERSION = version("karaoke-txt-song-timing-analysis")
 
 
 NOTE_RE = re.compile(
@@ -440,7 +444,7 @@ def transcribe_audio_windows(
     list[AudioWord],
     float,
     str,
-    str,
+    Optional[str],
     dict[str, list[AudioWord]],
     dict[str, str],
 ]:
@@ -490,7 +494,7 @@ def transcribe_audio_windows(
     )
 
     raw_windows: list[tuple[str, float, object, dict]] = []
-    detected_language = language or "en"
+    detected_language = language
     opening_text = ""
     for index, (label, start, chunk) in enumerate(windows):
         result = model.transcribe(
@@ -504,7 +508,7 @@ def transcribe_audio_windows(
                 f"{type(result).__name__}, expected a dictionary."
             )
         if index == 0:
-            detected_language = result.get("language") or language or "en"
+            detected_language = result.get("language") or language
         segments = result.get("segments", [])
         text = str(result.get("text", "") or "")
         if not text:
@@ -520,6 +524,11 @@ def transcribe_audio_windows(
     align_model = None
     metadata = None
     if any(data["segments"] for _, _, _, data in raw_windows):
+        if not detected_language:
+            raise RuntimeError(
+                "WhisperX did not report a language, so the transcription "
+                "cannot be aligned."
+            )
         align_model, metadata = whisperx.load_align_model(
             language_code=detected_language,
             device=device,
@@ -1504,6 +1513,7 @@ def format_summary_report(
 
     if include_header:
         lines.extend([
+            f"Version: {VERSION}",
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
             f"Match threshold: {args.match_threshold:.2f}",
@@ -1515,6 +1525,7 @@ def format_summary_report(
     for result in results:
         lines.extend([
             "-" * 78,
+            f"Processed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Chart: {result.chart_path}",
             f"Audio: {result.audio_path or 'Not found'}",
             f"Status: {result.status}",
@@ -1567,6 +1578,7 @@ def format_report(
         lines.extend([
             "UltraStar GAP Analysis Report",
             "=" * 78,
+            f"Version: {VERSION}",
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
             (
@@ -1587,6 +1599,7 @@ def format_report(
     for result in results:
         lines.extend([
             "-" * 78,
+            f"Processed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Chart: {result.chart_path}",
             f"Audio: {result.audio_path or 'Not found'}",
             f"Status: {result.status}",
@@ -1810,8 +1823,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--language",
-        default="en",
-        help="WhisperX language code (default: en).",
+        default=None,
+        help="WhisperX language code; omit to detect the language automatically.",
     )
     parser.add_argument(
         "--model",
