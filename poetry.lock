@@ -1460,6 +1460,19 @@ files = [
 ]
 
 [[package]]
+name = "korean-romanizer"
+version = "0.28.0"
+description = "A Python library for Korean romanization"
+optional = false
+python-versions = "*"
+groups = ["main"]
+markers = "sys_platform == \"win32\" or sys_platform == \"emscripten\" or sys_platform != \"win32\" and sys_platform != \"emscripten\""
+files = [
+    {file = "korean_romanizer-0.28.0-py3-none-any.whl", hash = "sha256:0077545c3ff8576c6296d9ea504f090746b57e2034479e0efe97ec9cf85a29e1"},
+    {file = "korean_romanizer-0.28.0.tar.gz", hash = "sha256:27d9f27396fa70483356cb0da0bf17b9ade4d30637a610f563b646b0cb2e525d"},
+]
+
+[[package]]
 name = "lightning"
 version = "2.6.6"
 description = "The Deep Learning framework to train, deploy, and ship AI products Lightning fast."
@@ -4646,4 +4659,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "8d8fc9031ebf1443e825d5eb75be903bfe84ced7b1a30159dd56f22410596f14"
+content-hash = "6d55a3e6d3b5174d6f017bd8b2cfc4cb56c91efb457f34f91566700c6e9f342a"

@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from korean_romanizer import Romanizer
+
 
 VERSION = version("karaoke-txt-song-timing-analysis")
 
@@ -70,6 +72,11 @@ MP3_RE = re.compile(r"^\s*#MP3:\s*(.*?)\s*$", re.I)
 RELATIVE_RE = re.compile(r"^\s*#RELATIVE:\s*(.*?)\s*$", re.I)
 
 TOKEN_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)?", re.I)
+HANGUL_RE = re.compile(
+    r"[\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7af\ud7b0-\ud7ff]"
+)
+GAP_WINDOW_FALLBACK_SECONDS = 90.0
+MIN_USABLE_CHART_WORDS = 3
 
 
 @dataclass
@@ -135,6 +142,8 @@ class Analysis:
     confidence: str = "Not assessed"
     reason: str = ""
     audio_duration: Optional[float] = None
+    audio_opening_seconds: Optional[float] = None
+    chart_opening_seconds: Optional[float] = None
     chart_words: Optional[list[ChartWord]] = None
     unknown_note_types: Optional[list[tuple[str, int]]] = None
     bpm_samples: Optional[list[BpmSample]] = None
@@ -154,6 +163,49 @@ def normalize_word(text: str) -> str:
 
 def tokens(text: str) -> list[str]:
     return [normalize_word(x) for x in TOKEN_RE.findall(text) if normalize_word(x)]
+
+
+def select_gap_opening_windows(
+    chart_words: list[ChartWord],
+    audio_opening_seconds: float,
+    chart_opening_seconds: float,
+) -> tuple[float, float]:
+    """Extend sparse opening lyric windows to 90 seconds."""
+    usable_words = sum(
+        len(normalize_word(word.text)) >= 3
+        for word in chart_words
+        if word.seconds <= chart_opening_seconds
+    )
+    if usable_words >= MIN_USABLE_CHART_WORDS:
+        return audio_opening_seconds, chart_opening_seconds
+
+    return (
+        max(audio_opening_seconds, GAP_WINDOW_FALLBACK_SECONDS),
+        max(chart_opening_seconds, GAP_WINDOW_FALLBACK_SECONDS),
+    )
+
+
+def prepare_audio_words_for_matching(
+    audio_words: list[AudioWord],
+    chart_words: list[ChartWord],
+    detected_language: Optional[str],
+) -> list[AudioWord]:
+    """Romanize Korean audio words when chart lyrics use Latin characters."""
+    language_code = (detected_language or "").casefold().split("-", maxsplit=1)[0]
+    if language_code != "ko" or any(
+        HANGUL_RE.search(word.text) for word in chart_words
+    ):
+        return audio_words
+
+    return [
+        AudioWord(
+            text=Romanizer(word.text).romanize(),
+            start=word.start,
+            end=word.end,
+            index=word.index,
+        )
+        for word in audio_words
+    ]
 
 
 def read_chart_text(path: Path) -> str:
@@ -1067,6 +1119,8 @@ def analyze_chart(
         old_gap_ms=gap_ms,
         bpm=bpm,
         status="Analysis failed",
+        audio_opening_seconds=args.audio_opening_seconds,
+        chart_opening_seconds=args.chart_opening_seconds,
         chart_words=chart_words,
         unknown_note_types=unknown_note_types,
     )
@@ -1096,11 +1150,19 @@ def analyze_chart(
             )
         return analysis
 
+    audio_opening_seconds, chart_opening_seconds = select_gap_opening_windows(
+        chart_words,
+        args.audio_opening_seconds,
+        args.chart_opening_seconds,
+    )
+    analysis.audio_opening_seconds = audio_opening_seconds
+    analysis.chart_opening_seconds = chart_opening_seconds
+
     # Restrict matching to the opening lyrics. Do not search the entire song
     # for a convenient but unrelated word.
     opening_chart_words = [
         word for word in chart_words
-        if word.seconds <= args.chart_opening_seconds
+        if word.seconds <= chart_opening_seconds
     ]
 
     if not opening_chart_words:
@@ -1121,7 +1183,7 @@ def analyze_chart(
             language=args.language,
             device=args.device,
             compute_type=args.compute_type,
-            opening_seconds=args.audio_opening_seconds,
+            opening_seconds=audio_opening_seconds,
             extra_windows=[],
         )
     except Exception as exc:
@@ -1141,11 +1203,15 @@ def analyze_chart(
     # against the original opening audio window.
     opening_chart_words = [
         word for word in chart_words
-        if word.seconds <= args.chart_opening_seconds
+        if word.seconds <= chart_opening_seconds
     ]
     matches = local_alignment(
         opening_chart_words,
-        opening_audio_words,
+        prepare_audio_words_for_matching(
+            opening_audio_words,
+            chart_words,
+            detected_language,
+        ),
         threshold=args.match_threshold,
     )
     analysis.matches = matches
@@ -1211,7 +1277,7 @@ def analyze_chart(
             BpmSampleDiagnostic(
                 label="Beginning",
                 audio_start=0.0,
-                audio_end=min(duration, args.audio_opening_seconds),
+                audio_end=min(duration, audio_opening_seconds),
                 chart_words=beginning_chart_words,
                 transcription=opening_transcriptions.get("opening", ""),
                 aligned_words=opening_audio_words,
@@ -1228,7 +1294,7 @@ def analyze_chart(
             chart_words=chart_words,
             corrected_gap_ms=gap_for_sampling,
             audio_duration=duration,
-            opening_seconds=args.audio_opening_seconds,
+            opening_seconds=audio_opening_seconds,
         )
         analysis.bpm_sample_notes.extend(selection_notes)
 
@@ -1270,7 +1336,11 @@ def analyze_chart(
             ]
             sample_matches = local_alignment(
                 chart_sample_words,
-                sample_audio,
+                prepare_audio_words_for_matching(
+                    sample_audio,
+                    chart_words,
+                    detected_language,
+                ),
                 threshold=args.match_threshold,
             )
             sample = summarize_bpm_sample(label, sample_matches)
@@ -1517,18 +1587,30 @@ def format_summary_report(
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
             f"Match threshold: {args.match_threshold:.2f}",
-            f"Audio opening window: {args.audio_opening_seconds:.1f} seconds",
-            f"Chart opening window: {args.chart_opening_seconds:.1f} seconds",
+            f"Initial audio opening window: {args.audio_opening_seconds:.1f} seconds",
+            f"Initial chart opening window: {args.chart_opening_seconds:.1f} seconds",
             "",
         ])
 
     for result in results:
+        audio_window = (
+            result.audio_opening_seconds
+            if result.audio_opening_seconds is not None
+            else args.audio_opening_seconds
+        )
+        chart_window = (
+            result.chart_opening_seconds
+            if result.chart_opening_seconds is not None
+            else args.chart_opening_seconds
+        )
         lines.extend([
             "-" * 78,
             f"Processed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Chart: {result.chart_path}",
             f"Audio: {result.audio_path or 'Not found'}",
             f"Status: {result.status}",
+            f"Audio opening window used: {audio_window:.1f} seconds",
+            f"Chart opening window used: {chart_window:.1f} seconds",
             f"Current #GAP: {format_ms(result.old_gap_ms)}",
             f"Current #BPM: {result.bpm:.1f}" if result.bpm is not None else "Current #BPM: Unknown",
         ])
@@ -1590,19 +1672,31 @@ def format_report(
                 )
             ),
             f"Match threshold: {args.match_threshold:.2f}",
-            f"Audio opening window: {args.audio_opening_seconds:.1f} seconds",
-            f"Chart opening window: {args.chart_opening_seconds:.1f} seconds",
+            f"Initial audio opening window: {args.audio_opening_seconds:.1f} seconds",
+            f"Initial chart opening window: {args.chart_opening_seconds:.1f} seconds",
             "BPM verification can sample later sections without transcribing the full song.",
             "",
         ])
 
     for result in results:
+        audio_window = (
+            result.audio_opening_seconds
+            if result.audio_opening_seconds is not None
+            else args.audio_opening_seconds
+        )
+        chart_window = (
+            result.chart_opening_seconds
+            if result.chart_opening_seconds is not None
+            else args.chart_opening_seconds
+        )
         lines.extend([
             "-" * 78,
             f"Processed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Chart: {result.chart_path}",
             f"Audio: {result.audio_path or 'Not found'}",
             f"Status: {result.status}",
+            f"Audio opening window used: {audio_window:.1f} seconds",
+            f"Chart opening window used: {chart_window:.1f} seconds",
             f"Current #GAP: {format_ms(result.old_gap_ms)}",
             f"Current #BPM: {result.bpm if result.bpm is not None else 'Unknown'}",
         ])
@@ -1675,7 +1769,7 @@ def format_report(
         if result.chart_words:
             chart_opening_words = [
                 word.text for word in result.chart_words
-                if word.seconds <= args.chart_opening_seconds
+                if word.seconds <= chart_window
             ]
             if chart_opening_words:
                 lines.extend([
@@ -1855,13 +1949,19 @@ def main() -> int:
         "--audio-opening-seconds",
         type=float,
         default=60.0,
-        help="How many seconds of audio to transcribe (default: 60).",
+        help=(
+            "Minimum audio opening window to transcribe; sparse chart lyrics "
+            "may extend it to 90 seconds (default: 60)."
+        ),
     )
     parser.add_argument(
         "--chart-opening-seconds",
         type=float,
         default=60.0,
-        help="How far into chart timing to consider opening lyrics (default: 60).",
+        help=(
+            "Minimum chart opening window to consider; sparse lyrics may "
+            "extend it to 90 seconds (default: 60)."
+        ),
     )
     parser.add_argument(
         "--max-correction-ms",
