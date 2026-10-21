@@ -69,8 +69,12 @@ language code, for example `--language de` for German.
 The report is created or overwritten at the path given by `--report`. It
 includes each chart's current and suggested `#GAP`, match confidence, analysis
 details, and any reason a suggestion was withheld or a chart could not be
-analyzed. The command also prints progress and the report location to the
-terminal.
+analyzed. A companion report with `_review` appended to the filename is also
+created or overwritten (for example, `gap_report.txt` produces
+`gap_report_review.txt`). It lists only eligible Medium/High GAP suggestions
+whose absolute correction is at least 1,000 ms, with the audio path, correction,
+and confidence. Both reports are updated after each song is processed. The
+command also prints progress and both report locations to the terminal.
 
 Use `--report-level summary` to write only the key settings and per-chart
 results. The default `--report-level all` keeps the detailed report. When

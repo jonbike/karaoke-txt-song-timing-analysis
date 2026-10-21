@@ -1892,6 +1892,24 @@ def format_report(
     return "\n".join(lines)
 
 
+def format_review_report_entry(result: Analysis) -> str:
+    if (
+        result.audio_path is None
+        or result.suggested_gap_ms is None
+        or result.correction_ms is None
+        or not math.isfinite(result.correction_ms)
+        or abs(result.correction_ms) < 1000
+        or result.confidence not in {"High", "Medium"}
+    ):
+        return ""
+
+    return "\n".join([
+        f"Audio: {result.audio_path}",
+        f"GAP Correction: {result.correction_ms:+.0f} ms",
+        f"Confidence: {result.confidence}",
+    ]) + "\n\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -2005,6 +2023,9 @@ def main() -> int:
 
     source = Path(args.source).expanduser().resolve()
     report_path = Path(args.report).expanduser().resolve()
+    review_report_path = report_path.with_name(
+        f"{report_path.stem}_review{report_path.suffix}"
+    )
 
     if not source.is_dir():
         print(f"Error: source directory does not exist: {source}", file=sys.stderr)
@@ -2013,24 +2034,26 @@ def main() -> int:
     # Existing reports may be overwritten, including reports inside the source
     # tree. Still refuse to overwrite an actual chart or audio file.
     audio_suffixes = {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".aac", ".opus"}
-    if report_path.exists():
-        if report_path.suffix.casefold() in audio_suffixes:
+    report_paths = {report_path, review_report_path}
+    for output_path in report_paths:
+        if output_path.exists() and output_path.suffix.casefold() in audio_suffixes:
             print(
-                "Error: report path points to an audio file; refusing to overwrite it.",
+                f"Error: report path points to an audio file: {output_path}; "
+                "refusing to overwrite it.",
                 file=sys.stderr,
             )
             return 2
-        if is_existing_ultrastar_chart(report_path):
+        if output_path.exists() and is_existing_ultrastar_chart(output_path):
             print(
-                "Error: report path points to an existing UltraStar chart; "
-                "refusing to overwrite it.",
+                f"Error: report path points to an existing UltraStar chart: "
+                f"{output_path}; refusing to overwrite it.",
                 file=sys.stderr,
             )
             return 2
 
     chart_paths = sorted(
         p for p in source.rglob("*.txt")
-        if p.is_file() and p.resolve() != report_path
+        if p.is_file() and p.resolve() not in report_paths
     )
 
     if not chart_paths:
@@ -2040,37 +2063,44 @@ def main() -> int:
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         with report_path.open("w", encoding="utf-8") as report_file:
-            report_file.write(format_report([], args))
-            for index, chart_path in enumerate(chart_paths, start=1):
-                print(f"[{index}/{len(chart_paths)}] Analyzing: {chart_path}")
-                try:
-                    result = analyze_chart_in_child_process(chart_path, args)
-                except Exception as exc:
-                    result = Analysis(
-                        chart_path=chart_path,
-                        audio_path=find_audio_for_chart(chart_path),
-                        old_gap_ms=None,
-                        bpm=None,
-                        status="Analysis failed",
-                        reason=f"{type(exc).__name__}: {exc}",
-                    )
-                    if args.debug:
-                        result.reason += "\n" + traceback.format_exc()
-
-                if args.write_gap:
-                    result.gap_write_status = write_gap_update(result)
-                report_file.write(
-                    format_report([result], args, include_header=False)
+            with review_report_path.open("w", encoding="utf-8") as review_report_file:
+                report_file.write(format_report([], args))
+                review_report_file.write(
+                    "Songs with recommended GAP corrections of at least 1,000 ms\n\n"
                 )
-                report_file.flush()
-                print(f"    {result.status}: {result.confidence}")
-                del result
+                for index, chart_path in enumerate(chart_paths, start=1):
+                    print(f"[{index}/{len(chart_paths)}] Analyzing: {chart_path}")
+                    try:
+                        result = analyze_chart_in_child_process(chart_path, args)
+                    except Exception as exc:
+                        result = Analysis(
+                            chart_path=chart_path,
+                            audio_path=find_audio_for_chart(chart_path),
+                            old_gap_ms=None,
+                            bpm=None,
+                            status="Analysis failed",
+                            reason=f"{type(exc).__name__}: {exc}",
+                        )
+                        if args.debug:
+                            result.reason += "\n" + traceback.format_exc()
+
+                    if args.write_gap:
+                        result.gap_write_status = write_gap_update(result)
+                    report_file.write(
+                        format_report([result], args, include_header=False)
+                    )
+                    review_report_file.write(format_review_report_entry(result))
+                    report_file.flush()
+                    review_report_file.flush()
+                    print(f"    {result.status}: {result.confidence}")
+                    del result
     except OSError as exc:
-        print(f"Could not write report: {exc}", file=sys.stderr)
+        print(f"Could not write report(s): {exc}", file=sys.stderr)
         return 2
 
     print()
     print(f"Report written to: {report_path}")
+    print(f"Review report written to: {review_report_path}")
     if args.write_gap:
         print("Audio files were not modified; eligible chart #GAP values may have been updated.")
     else:
