@@ -36,6 +36,7 @@ import re
 import shutil
 import stat
 import statistics
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -1123,9 +1124,87 @@ def select_bpm_sample_windows(
     return windows, notes
 
 
+def separate_vocals(
+    audio_path: Path,
+    device: str,
+    output_directory: Path,
+) -> Path:
+    """Run Demucs and return its isolated vocals.wav stem."""
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "demucs.separate",
+            "--two-stems=vocals",
+            "-d",
+            device,
+            "--out",
+            str(output_directory),
+            str(audio_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    vocal_stems = list(output_directory.rglob("vocals.wav"))
+    if len(vocal_stems) != 1:
+        raise RuntimeError(
+            "Demucs completed but expected exactly one vocals.wav stem; "
+            f"found {len(vocal_stems)}."
+        )
+    return vocal_stems[0]
+
+
 def analyze_chart(
     chart_path: Path,
     args: argparse.Namespace,
+) -> Analysis:
+    gap_ms, bpm, chart_words = parse_chart(chart_path)
+    audio_path = find_audio_for_chart(chart_path)
+    if (
+        audio_path is None
+        or bpm is None
+        or bpm <= 0
+        or gap_ms is None
+        or not chart_words
+    ):
+        return _analyze_chart_with_audio(chart_path, args)
+
+    with tempfile.TemporaryDirectory(prefix="karaoke-demucs-") as temporary:
+        try:
+            vocals_path = separate_vocals(
+                audio_path,
+                args.device,
+                Path(temporary),
+            )
+        except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+            reason = f"Demucs vocal separation failed: {type(exc).__name__}: {exc}"
+            if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+                reason += f"\nDemucs stderr: {exc.stderr.strip()}"
+            if args.debug:
+                reason += "\n" + traceback.format_exc()
+            return Analysis(
+                chart_path=chart_path,
+                audio_path=audio_path,
+                old_gap_ms=gap_ms,
+                bpm=bpm,
+                status="Analysis failed",
+                reason=reason,
+                chart_words=chart_words,
+                unknown_note_types=detect_unknown_note_types(chart_path),
+            )
+        return _analyze_chart_with_audio(
+            chart_path,
+            args,
+            transcription_audio_path=vocals_path,
+        )
+
+
+def _analyze_chart_with_audio(
+    chart_path: Path,
+    args: argparse.Namespace,
+    transcription_audio_path: Optional[Path] = None,
 ) -> Analysis:
     gap_ms, bpm, chart_words = parse_chart(chart_path)
     unknown_note_types = detect_unknown_note_types(chart_path)
@@ -1168,6 +1247,8 @@ def analyze_chart(
             )
         return analysis
 
+    transcription_audio_path = transcription_audio_path or audio_path
+
     audio_opening_seconds, chart_opening_seconds = select_gap_opening_windows(
         chart_words,
         args.audio_opening_seconds,
@@ -1202,7 +1283,7 @@ def analyze_chart(
             _,
             opening_transcriptions,
         ) = transcribe_audio_windows(
-            audio_path=audio_path,
+            audio_path=transcription_audio_path,
             model_name=args.model,
             language=args.language,
             device=args.device,
@@ -1224,7 +1305,7 @@ def analyze_chart(
     analysis.status = "Analysis complete"
 
     # Preserve the existing GAP estimate: align the chart's opening lyrics
-    # against the original opening audio window.
+    # against the opening vocal-stem window.
     opening_chart_words = [
         word for word in chart_words
         if (
@@ -1339,7 +1420,7 @@ def analyze_chart(
                     transcribed_windows,
                     sample_transcriptions,
                 ) = transcribe_audio_windows(
-                    audio_path=audio_path,
+                    audio_path=transcription_audio_path,
                     model_name=args.model,
                     language=detected_language,
                     device=args.device,

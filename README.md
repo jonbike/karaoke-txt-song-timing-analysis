@@ -5,7 +5,9 @@ whether the chart's `#GAP` value should be adjusted and optionally verify its
 `#BPM`. The tool uses WhisperX transcription and word timestamps to compare
 chart lyrics with the recorded vocals, then writes its findings to a text
 report. GAP analysis uses the opening lyrics; optional BPM analysis samples
-selected sections of the song and is disabled by default.
+selected sections of the song and is disabled by default. Demucs separates the
+vocals before transcription so both GAP and optional BPM analysis use the
+isolated vocal stem.
 
 By default, analysis does not change chart or audio files. Optional `#GAP`
 updates are available with `--write-gap`; see [Writing suggested GAP values](#writing-suggested-gap-values)
@@ -18,10 +20,21 @@ before enabling it.
 - Audio files supported by WhisperX, such as MP3, M4A, WAV, FLAC, OGG, AAC,
   or Opus
 
-WhisperX and its Python dependencies are installed through Poetry. The selected
-WhisperX model may need to be downloaded the first time it is used. CPU
-inference is supported; CUDA can be selected on a machine with a compatible
-CUDA/PyTorch setup.
+Poetry installs the project's Python dependencies, including
+`korean-romanizer` for Korean lyric matching and Demucs for music source
+separation. WhisperX and its transcription dependencies are declared for Linux
+and Windows. Windows dependency resolution and runtime behavior have not yet
+been tested, so Windows support is intended but unverified. Demucs 4.1.0's
+PyTorch dependency constraints allow it on Linux and Windows; macOS is not
+supported by this dependency setup.
+
+The selected WhisperX model may need to be downloaded the first time it is
+used. CPU inference is supported; CUDA can be selected on a machine with a
+compatible CUDA/PyTorch setup. Demucs runs on the same device selected for
+analysis (`cpu` by default, or `cuda` when requested). It writes its
+`vocals.wav` stem to an isolated temporary directory; that directory is
+removed after the song has been analyzed. Demucs failures are reported and do
+not silently fall back to transcribing the original mix.
 
 When WhisperX detects Korean and chart lyrics contain no Hangul, aligned
 Whisper words are romanized using Revised Romanization for lyric matching.
