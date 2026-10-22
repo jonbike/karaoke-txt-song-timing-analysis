@@ -88,6 +88,28 @@ class SelectGapOpeningWindowsTests(unittest.TestCase):
             (60, 60),
         )
 
+    def test_extends_when_existing_gap_puts_chart_start_late_in_audio(self) -> None:
+        chart_words = [
+            ChartWord(text=text, beat=index, seconds=index, index=index)
+            for index, text in enumerate(("hello", "world", "again"))
+        ]
+
+        self.assertEqual(
+            select_gap_opening_windows(chart_words, 60, 60, 56380),
+            (90, 90),
+        )
+
+    def test_keeps_window_when_existing_gap_does_not_put_chart_start_late(self) -> None:
+        chart_words = [
+            ChartWord(text=text, beat=index, seconds=index, index=index)
+            for index, text in enumerate(("hello", "world", "again"))
+        ]
+
+        self.assertEqual(
+            select_gap_opening_windows(chart_words, 60, 60, 20000),
+            (60, 60),
+        )
+
     def test_extends_both_windows_when_fewer_than_three_informative_words(self) -> None:
         chart_words = [
             ChartWord(text="hello", beat=0, seconds=10, index=0),

@@ -93,8 +93,8 @@ chart's `#GAP` write attempt.
 | `--device` | `cpu` | Inference device: `cpu` or `cuda`. |
 | `--compute-type` | Device-dependent | WhisperX compute type; defaults to `int8` on CPU and `float16` on CUDA. |
 | `--match-threshold` | `0.55` | Minimum fuzzy word similarity from 0 to 1. Lower values allow less-exact matches. |
-| `--audio-opening-seconds` | `60` | Minimum opening audio window; may extend to 90 seconds when chart lyrics are sparse. |
-| `--chart-opening-seconds` | `60` | Minimum chart opening window; may extend to 90 seconds when chart lyrics are sparse. |
+| `--audio-opening-seconds` | `60` | Minimum opening audio window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
+| `--chart-opening-seconds` | `60` | Minimum chart opening window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
 | `--max-correction-ms` | `15000` | Maximum correction allowed for a GAP suggestion. |
 | `--bpm` | `off` | Set to `on` to enable BPM analysis using sampled song sections. |
 | `--write-gap` | Off | Update charts when a GAP suggestion is eligible. |
@@ -111,12 +111,13 @@ modified. Review the report and keep backups before enabling chart updates.
 
 ## Limitations
 
-- GAP analysis starts with the opening audio and chart windows. If fewer than
-  three informative chart words (at least three characters each) occur in the
-  initial chart window, both windows extend to 90 seconds so later opening
-  lyrics can be considered. Explicitly configured windows longer than 90
-  seconds are preserved. It does not transcribe the entire song for this
-  estimate.
+- GAP analysis starts with the opening audio and chart windows, mapping chart
+  word times into audio time using the current `#GAP`. If fewer than three
+  informative chart words (at least three characters each) fall in both
+  initial windows, or the first lyric is expected in the latter half of the
+  audio window, both windows extend to 90 seconds. Explicitly configured
+  windows longer than 90 seconds are preserved. It does not transcribe the
+  entire song for this estimate.
 - Charts without a valid BPM, GAP, lyric timings, or matching audio cannot
   produce a GAP suggestion. The report records the reason.
 - BPM verification is disabled by default. Enable it with `--bpm on`; it

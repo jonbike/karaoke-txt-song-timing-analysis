@@ -169,14 +169,32 @@ def select_gap_opening_windows(
     chart_words: list[ChartWord],
     audio_opening_seconds: float,
     chart_opening_seconds: float,
+    gap_ms: float = 0.0,
 ) -> tuple[float, float]:
-    """Extend sparse opening lyric windows to 90 seconds."""
-    usable_words = sum(
-        len(normalize_word(word.text)) >= 3
+    """Extend sparse or late-starting opening lyric windows to 90 seconds."""
+    gap_seconds = gap_ms / 1000.0
+    opening_words = [
+        word
         for word in chart_words
         if word.seconds <= chart_opening_seconds
+        and 0 <= word.seconds + gap_seconds <= audio_opening_seconds
+    ]
+    usable_words = sum(
+        len(normalize_word(word.text)) >= 3 for word in opening_words
     )
-    if usable_words >= MIN_USABLE_CHART_WORDS:
+    expected_first_lyric = min(
+        (
+            word.seconds + gap_seconds
+            for word in chart_words
+            if word.seconds + gap_seconds >= 0
+        ),
+        default=None,
+    )
+    starts_late = (
+        expected_first_lyric is not None
+        and expected_first_lyric >= audio_opening_seconds / 2.0
+    )
+    if usable_words >= MIN_USABLE_CHART_WORDS and not starts_late:
         return audio_opening_seconds, chart_opening_seconds
 
     return (
@@ -1154,6 +1172,7 @@ def analyze_chart(
         chart_words,
         args.audio_opening_seconds,
         args.chart_opening_seconds,
+        gap_ms,
     )
     analysis.audio_opening_seconds = audio_opening_seconds
     analysis.chart_opening_seconds = chart_opening_seconds
@@ -1162,7 +1181,12 @@ def analyze_chart(
     # for a convenient but unrelated word.
     opening_chart_words = [
         word for word in chart_words
-        if word.seconds <= chart_opening_seconds
+        if (
+            word.seconds <= chart_opening_seconds
+            and 0
+            <= word.seconds + gap_ms / 1000.0
+            <= audio_opening_seconds
+        )
     ]
 
     if not opening_chart_words:
@@ -1203,7 +1227,12 @@ def analyze_chart(
     # against the original opening audio window.
     opening_chart_words = [
         word for word in chart_words
-        if word.seconds <= chart_opening_seconds
+        if (
+            word.seconds <= chart_opening_seconds
+            and 0
+            <= word.seconds + gap_ms / 1000.0
+            <= audio_opening_seconds
+        )
     ]
     matches = local_alignment(
         opening_chart_words,
