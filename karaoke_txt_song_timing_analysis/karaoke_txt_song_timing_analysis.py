@@ -767,7 +767,7 @@ def estimate_bpm_from_samples(
             f"for a stronger confidence assessment. {sample_summary}"
         )
     elif (
-        len(usable) >= 4
+        len(usable) >= 3
         and all(sample.match_count >= 4 for sample in usable)
         and residual_mad <= 500
         and all(sample.spread_ms <= 700 for sample in usable)
