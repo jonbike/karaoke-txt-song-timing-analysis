@@ -1,6 +1,6 @@
 [project]
 name = "karaoke-txt-song-timing-analysis"
-version = "0.2.6"
+version = "0.2.7"
 description = ""
 authors = [
     {name = "Jonathan Moore",email = "jonbike@jonathanmoore.eu"}

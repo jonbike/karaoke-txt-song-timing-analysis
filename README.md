@@ -9,9 +9,10 @@ selected sections of the song and is disabled by default. Demucs separates the
 vocals before transcription so both GAP and optional BPM analysis use the
 isolated vocal stem.
 
-By default, analysis does not change chart or audio files. Optional `#GAP`
-updates are available with `--write-gap`; see [Writing suggested GAP values](#writing-suggested-gap-values)
-before enabling it.
+By default, analysis does not change chart or audio files. Optional `#GAP` and
+`#BPM` updates are available with `--write-gap` and `--write-bpm`; see
+[Writing suggested chart values](#writing-suggested-chart-values) before enabling
+them.
 
 ## Requirements
 
@@ -117,14 +118,19 @@ chart's `#GAP` write attempt.
 | `--max-correction-ms` | `15000` | Maximum correction allowed for a GAP suggestion. |
 | `--bpm` | `off` | Set to `on` to enable BPM analysis using sampled song sections. |
 | `--write-gap` | Off | Update charts when a GAP suggestion is eligible. |
+| `--write-bpm` | Off | Update charts when a BPM suggestion is eligible; requires `--bpm on`. |
 | `--debug` | Off | Include full exception tracebacks in the report. |
 
-## Writing suggested GAP values
+## Writing suggested chart values
 
-Without `--write-gap`, chart and audio files are read only. With
-`--write-gap`, a chart is updated only when the GAP estimate has Medium or High
+Without `--write-gap` or `--write-bpm`, chart and audio files are read only.
+`--write-gap` updates a chart only when the GAP estimate has Medium or High
 confidence, is finite, and differs from the current value by at least 100 ms.
-Before changing a chart, the tool refreshes a sibling backup named
+`--write-bpm` requires `--bpm on` and updates only finite, positive BPM
+suggestions with Medium or High confidence. BPM values are written to three
+decimal places; there is no additional minimum-change threshold. If both
+options are enabled, eligible values are written together from one chart
+snapshot. Before changing a chart, the tool refreshes a sibling backup named
 `<chart-stem>.bak` (for example, `song.bak` for `song.txt`). Audio files are never
 modified. Review the report and keep backups before enabling chart updates.
 

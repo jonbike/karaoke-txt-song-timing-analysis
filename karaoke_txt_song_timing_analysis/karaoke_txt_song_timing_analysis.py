@@ -4,8 +4,8 @@ Estimate UltraStar Deluxe #GAP values using WhisperX word timestamps.
 
 Safety:
 - Reads audio and .txt chart files only.
-- Does not modify charts, audio, or other source files.
-- Writes a text report only unless --write-gap is enabled.
+- Does not modify charts or audio unless a chart-writing option is enabled.
+- Writes a text report only unless --write-gap or --write-bpm is enabled.
 
 Example:
     poetry run python ultrastar_gap.py \
@@ -65,6 +65,11 @@ GAP_RE = re.compile(rf"^\s*#GAP:\s*({NUMBER_RE})", re.I)
 MIN_GAP_WRITE_CHANGE_MS = 100.0
 GAP_BYTES_RE = re.compile(
     rb"^(\xef\xbb\xbf)?([ \t]*#GAP:[ \t]*)"
+    rb"([+-]?\d+(?:[.,]\d+)?)([ \t]*(?:\r?\n)?)$",
+    re.I,
+)
+BPM_BYTES_RE = re.compile(
+    rb"^(\xef\xbb\xbf)?([ \t]*#BPM:[ \t]*)"
     rb"([+-]?\d+(?:[.,]\d+)?)([ \t]*(?:\r?\n)?)$",
     re.I,
 )
@@ -157,6 +162,7 @@ class Analysis:
     bpm_sample_notes: list[str] = field(default_factory=list)
     bpm_sample_diagnostics: list[BpmSampleDiagnostic] = field(default_factory=list)
     gap_write_status: str = ""
+    bpm_write_status: str = ""
 
 
 def normalize_word(text: str) -> str:
@@ -1708,78 +1714,183 @@ def analyze_chart_with_cpu_fallback(
     return cpu_result
 
 
-def write_gap_update(result: Analysis) -> str:
-    """Back up a chart and atomically write a confident GAP suggestion."""
-    if result.confidence not in {"High", "Medium"}:
-        return (
-            f"Skipped: GAP confidence is {result.confidence}; "
-            "only Medium or High confidence is writable."
-        )
-    if result.suggested_gap_ms is None or not math.isfinite(result.suggested_gap_ms):
-        return "Skipped: no finite GAP suggestion is available."
+def write_chart_updates(
+    result: Analysis,
+    write_gap: bool,
+    write_bpm: bool,
+) -> tuple[str, str]:
+    """Back up a chart once and atomically write eligible GAP/BPM suggestions."""
+    gap_status = ""
+    bpm_status = ""
+    if write_gap:
+        if result.confidence not in {"High", "Medium"}:
+            gap_status = (
+                f"Skipped: GAP confidence is {result.confidence}; "
+                "only Medium or High confidence is writable."
+            )
+        elif result.suggested_gap_ms is None or not math.isfinite(result.suggested_gap_ms):
+            gap_status = "Skipped: no finite GAP suggestion is available."
+        elif result.old_gap_ms is None or not math.isfinite(result.old_gap_ms):
+            gap_status = "Skipped: no finite current #GAP value is available."
+
+    if write_bpm:
+        if result.bpm_confidence not in {"High", "Medium"}:
+            bpm_status = (
+                f"Skipped: BPM confidence is {result.bpm_confidence}; "
+                "only Medium or High confidence is writable."
+            )
+        elif (
+            result.suggested_bpm is None
+            or not math.isfinite(result.suggested_bpm)
+            or result.suggested_bpm <= 0
+        ):
+            bpm_status = "Skipped: no finite positive BPM suggestion is available."
+        elif result.bpm is None or not math.isfinite(result.bpm) or result.bpm <= 0:
+            bpm_status = "Skipped: no finite positive current #BPM value is available."
+
+    if not (
+        (write_gap and not gap_status)
+        or (write_bpm and not bpm_status)
+    ):
+        return gap_status, bpm_status
 
     chart_path = result.chart_path
     if chart_path.is_symlink():
-        return "Skipped: chart is a symbolic link; refusing to replace its path."
+        refusal = "Skipped: chart is a symbolic link; refusing to replace its path."
+        return (
+            refusal if write_gap and not gap_status else gap_status,
+            refusal if write_bpm and not bpm_status else bpm_status,
+        )
+
     try:
         original = chart_path.read_bytes()
-        current_gap, _, _ = parse_chart(chart_path)
-    except (OSError, UnicodeError, ValueError) as exc:
-        return f"Failed to read chart before update: {type(exc).__name__}: {exc}"
-
-    if current_gap != result.old_gap_ms:
+    except OSError as exc:
+        failure = f"Failed to read chart before update: {type(exc).__name__}: {exc}"
         return (
-            "Skipped: chart #GAP changed after analysis "
-            f"(analyzed {format_ms(result.old_gap_ms)}, now {format_ms(current_gap)})."
+            failure if write_gap and not gap_status else gap_status,
+            failure if write_bpm and not bpm_status else bpm_status,
         )
 
     lines = original.splitlines(keepends=True)
-    gap_line_indexes = [
-        index for index, line in enumerate(lines)
-        if GAP_BYTES_RE.match(line)
-    ]
-    if len(gap_line_indexes) != 1:
-        return (
-            "Skipped: expected exactly one writable #GAP line, "
-            f"found {len(gap_line_indexes)}."
+    updates: list[tuple[str, int, bytes, str, float, float]] = []
+    requested_fields = []
+    if write_gap and not gap_status:
+        requested_fields.append(
+            ("#GAP", GAP_BYTES_RE, result.old_gap_ms, result.suggested_gap_ms, 0)
+        )
+    if write_bpm and not bpm_status:
+        requested_fields.append(
+            ("#BPM", BPM_BYTES_RE, result.bpm, result.suggested_bpm, 3)
         )
 
-    new_gap_text = f"{result.suggested_gap_ms:.0f}"
-    new_gap_value = float(new_gap_text)
-    gap_change = abs(new_gap_value - current_gap)
-    if gap_change == 0:
-        return f"No update needed: #GAP is already {new_gap_text}."
-    if gap_change < MIN_GAP_WRITE_CHANGE_MS:
-        return (
-            f"Skipped: proposed #GAP change is {gap_change:.1f} ms, below "
-            f"the {MIN_GAP_WRITE_CHANGE_MS:.0f} ms write threshold."
+    for field_name, pattern, analyzed_value, suggested_value, decimals in requested_fields:
+        matches = [
+            (index, pattern.match(line))
+            for index, line in enumerate(lines)
+            if pattern.match(line)
+        ]
+        if len(matches) != 1:
+            status = (
+                f"Skipped: expected exactly one writable {field_name} line, "
+                f"found {len(matches)}."
+            )
+            if field_name == "#GAP":
+                gap_status = status
+            else:
+                bpm_status = status
+            continue
+
+        line_index, match = matches[0]
+        if match is None:
+            status = f"Skipped: could not safely parse the existing {field_name} line."
+            if field_name == "#GAP":
+                gap_status = status
+            else:
+                bpm_status = status
+            continue
+
+        current_value = float(match.group(3).decode("ascii").replace(",", "."))
+        if current_value != analyzed_value:
+            if field_name == "#GAP":
+                status = (
+                    "Skipped: chart #GAP changed after analysis "
+                    f"(analyzed {format_ms(analyzed_value)}, "
+                    f"now {format_ms(current_value)})."
+                )
+            else:
+                status = (
+                    "Skipped: chart #BPM changed after analysis "
+                    f"(analyzed {analyzed_value}, now {current_value})."
+                )
+            if field_name == "#GAP":
+                gap_status = status
+            else:
+                bpm_status = status
+            continue
+
+        new_value_text = f"{suggested_value:.{decimals}f}"
+        new_value = float(new_value_text)
+        if field_name == "#GAP":
+            change = abs(new_value - current_value)
+            if change == 0:
+                gap_status = f"No update needed: {field_name} is already {new_value_text}."
+                continue
+            if change < MIN_GAP_WRITE_CHANGE_MS:
+                gap_status = (
+                    f"Skipped: proposed #GAP change is {change:.1f} ms, below "
+                    f"the {MIN_GAP_WRITE_CHANGE_MS:.0f} ms write threshold."
+                )
+                continue
+        elif new_value == current_value:
+            bpm_status = f"No update needed: {field_name} is already {new_value_text}."
+            continue
+
+        updates.append(
+            (field_name, line_index, match.group(2), new_value_text, current_value, new_value)
         )
 
-    line_index = gap_line_indexes[0]
-    match = GAP_BYTES_RE.match(lines[line_index])
-    if match is None:
-        return "Skipped: could not safely parse the existing #GAP line."
-    updated_line = (
-        (match.group(1) or b"")
-        + match.group(2)
-        + new_gap_text.encode("ascii")
-        + match.group(4)
-    )
-    lines[line_index] = updated_line
+    if not updates:
+        return gap_status, bpm_status
+
+    for field_name, line_index, prefix, new_value_text, _, _ in updates:
+        match = (GAP_BYTES_RE if field_name == "#GAP" else BPM_BYTES_RE).match(
+            lines[line_index]
+        )
+        if match is None:
+            status = f"Skipped: could not safely parse the existing {field_name} line."
+            if field_name == "#GAP":
+                gap_status = status
+            else:
+                bpm_status = status
+            continue
+        lines[line_index] = (
+            (match.group(1) or b"")
+            + prefix
+            + new_value_text.encode("ascii")
+            + match.group(4)
+        )
     updated = b"".join(lines)
     backup_path = chart_path.with_suffix(".bak")
     if backup_path.is_symlink():
-        return "Failed to update chart: refusing to overwrite a symbolic-link backup."
+        failure = "Failed to update chart: refusing to overwrite a symbolic-link backup."
+        return (
+            failure if any(field == "#GAP" for field, *_ in updates) else gap_status,
+            failure if any(field == "#BPM" for field, *_ in updates) else bpm_status,
+        )
+
     temporary_path: Optional[Path] = None
     update_error: Optional[OSError] = None
     cleanup_error: Optional[OSError] = None
-
     try:
         shutil.copy2(chart_path, backup_path)
         if backup_path.read_bytes() != original:
-            return (
+            failure = (
                 "Skipped: chart contents changed while preparing the backup; "
                 f"the refreshed backup is {backup_path}."
+            )
+            return (
+                failure if any(field == "#GAP" for field, *_ in updates) else gap_status,
+                failure if any(field == "#BPM" for field, *_ in updates) else bpm_status,
             )
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{chart_path.name}.",
@@ -1803,24 +1914,55 @@ def write_gap_update(result: Analysis) -> str:
                 cleanup_error = exc
 
     if update_error is not None:
-        status = (
+        failure = (
             f"Failed to update chart: {type(update_error).__name__}: "
             f"{update_error}"
         )
         if backup_path.exists():
-            status += f" Backup: {backup_path}"
+            failure += f" Backup: {backup_path}"
+        for field_name, *_ in updates:
+            if field_name == "#GAP":
+                gap_status = failure
+            else:
+                bpm_status = failure
     else:
-        status = (
-            f"Updated #GAP from {format_ms(current_gap)} to {new_gap_text}; "
-            f"backup: {backup_path}."
-        )
+        for field_name, _, _, new_value_text, current_value, _ in updates:
+            if field_name == "#GAP":
+                status = (
+                    f"Updated #GAP from {format_ms(current_value)} to "
+                    f"{format_ms(float(new_value_text))}; backup: {backup_path}."
+                )
+            else:
+                status = (
+                    f"Updated #BPM from {current_value:g} to {new_value_text}; "
+                    f"backup: {backup_path}."
+                )
+            if field_name == "#GAP":
+                gap_status = status
+            else:
+                bpm_status = status
+
     if cleanup_error is not None:
-        status += (
+        cleanup_message = (
             f" Temporary-file cleanup failed: {type(cleanup_error).__name__}: "
             f"{cleanup_error}"
         )
+        if any(field == "#GAP" for field, *_ in updates):
+            gap_status += cleanup_message
+        if any(field == "#BPM" for field, *_ in updates):
+            bpm_status += cleanup_message
 
-    return status
+    return gap_status, bpm_status
+
+
+def write_gap_update(result: Analysis) -> str:
+    """Back up a chart and write an eligible GAP suggestion."""
+    return write_chart_updates(result, write_gap=True, write_bpm=False)[0]
+
+
+def write_bpm_update(result: Analysis) -> str:
+    """Back up a chart and write an eligible BPM suggestion."""
+    return write_chart_updates(result, write_gap=False, write_bpm=True)[1]
 
 
 def format_ms(value: Optional[float]) -> str:
@@ -1893,8 +2035,32 @@ def format_summary_report(
             f"Confidence: {result.confidence}",
             f"Reason: {(result.reason or 'No additional details').splitlines()[0]}",
         ])
+        if args.bpm == "on":
+            if (
+                result.suggested_bpm is not None
+                and result.bpm_correction is not None
+                and result.bpm_confidence in {"High", "Medium"}
+            ):
+                lines.extend([
+                    f"Suggested #BPM: {result.suggested_bpm:.3f}",
+                    f"BPM correction: {result.bpm_correction:+.3f}",
+                    f"BPM confidence: {result.bpm_confidence}",
+                ])
+            else:
+                lines.extend([
+                    "Suggested #BPM: Withheld",
+                    (
+                        f"BPM correction: {result.bpm_correction:+.3f} "
+                        "(diagnostic only)"
+                        if result.bpm_correction is not None
+                        else "BPM correction: Not assessed"
+                    ),
+                    f"BPM confidence: {result.bpm_confidence}",
+                ])
         if args.write_gap:
             lines.append(f"#GAP write: {result.gap_write_status}")
+        if args.write_bpm:
+            lines.append(f"#BPM write: {result.bpm_write_status}")
         lines.append("")
 
     return "\n".join(lines)
@@ -1920,10 +2086,11 @@ def format_report(
             "",
             (
                 "Safety: source audio and chart files were read only."
-                if not args.write_gap
+                if not (args.write_gap or args.write_bpm)
                 else (
-                    "Safety: source audio is read only; charts are updated only "
-                    "when GAP confidence is Medium or High, after a .bak backup."
+                    "Safety: source audio is read only; eligible chart values "
+                    "are updated only at Medium or High confidence, after a "
+                    ".bak backup."
                 )
             ),
             f"Match threshold: {args.match_threshold:.2f}",
@@ -1981,6 +2148,8 @@ def format_report(
         ])
         if args.write_gap:
             lines.append(f"#GAP write: {result.gap_write_status}")
+        if args.write_bpm:
+            lines.append(f"#BPM write: {result.bpm_write_status}")
 
         if args.bpm == "off":
             lines.extend(["BPM verification: Disabled by --bpm off."])
@@ -2169,7 +2338,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Estimate UltraStar #GAP values and verify #BPM using sampled "
-            "chart lyrics and WhisperX word timestamps. Source files are never modified."
+            "chart lyrics and WhisperX word timestamps. Source files are read only "
+            "unless a chart-writing option is enabled."
         )
     )
     parser.add_argument(
@@ -2257,6 +2427,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--write-bpm",
+        action="store_true",
+        help=(
+            "Update chart #BPM values when confidence is Medium or High; "
+            "requires --bpm on and refreshes a sibling .bak backup first."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Include full exception tracebacks in the report.",
@@ -2272,6 +2450,9 @@ def main() -> int:
 
     if args.max_correction_ms < 0:
         parser.error("--max-correction-ms cannot be negative.")
+
+    if args.write_bpm and args.bpm != "on":
+        parser.error("--write-bpm requires --bpm on.")
 
     if args.compute_type is None:
         args.compute_type = "int8" if args.device == "cpu" else "float16"
@@ -2353,8 +2534,15 @@ def main() -> int:
                         if args.debug:
                             result.reason += "\n" + traceback.format_exc()
 
-                    if args.write_gap:
-                        result.gap_write_status = write_gap_update(result)
+                    if args.write_gap or args.write_bpm:
+                        (
+                            result.gap_write_status,
+                            result.bpm_write_status,
+                        ) = write_chart_updates(
+                            result,
+                            write_gap=args.write_gap,
+                            write_bpm=args.write_bpm,
+                        )
                     report_file.write(
                         format_report([result], args, include_header=False)
                     )
@@ -2371,8 +2559,11 @@ def main() -> int:
     print()
     print(f"Report written to: {report_path}")
     print(f"Review report written to: {review_report_path}")
-    if args.write_gap:
-        print("Audio files were not modified; eligible chart #GAP values may have been updated.")
+    if args.write_gap or args.write_bpm:
+        print(
+            "Audio files were not modified; eligible chart #GAP and/or #BPM "
+            "values may have been updated."
+        )
     else:
         print("Audio and chart files were not modified.")
 
