@@ -2,6 +2,7 @@ import contextlib
 import io
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,36 @@ from karaoke_txt_song_timing_analysis import karaoke_txt_song_timing_analysis as
 
 
 class ReviewReportTests(unittest.TestCase):
+    def test_completion_estimate_uses_recent_completed_songs(self) -> None:
+        now = datetime(2026, 10, 23, 8, 0)
+
+        estimate = analysis.estimate_completion_time(
+            list(range(1, 12)),
+            remaining_songs=2,
+            now=now,
+        )
+
+        self.assertEqual(estimate, datetime(2026, 10, 23, 8, 0, 13))
+
+    def test_completion_estimate_is_unavailable_before_first_song_finishes(self) -> None:
+        self.assertIsNone(analysis.estimate_completion_time([], remaining_songs=3))
+
+    def test_estimated_end_format_includes_day_offset_when_needed(self) -> None:
+        now = datetime(2026, 10, 23, 8, 0)
+
+        self.assertEqual(
+            analysis.format_estimated_end(datetime(2026, 10, 23, 23, 56), now),
+            "23:56",
+        )
+        self.assertEqual(
+            analysis.format_estimated_end(datetime(2026, 10, 24, 0, 5), now),
+            "+1 day 00:05",
+        )
+        self.assertEqual(
+            analysis.format_estimated_end(datetime(2026, 10, 25, 3, 0), now),
+            "+2 days 03:00",
+        )
+
     def test_entry_includes_eligible_corrections_of_at_least_one_second(self) -> None:
         result = analysis.Analysis(
             chart_path=Path("/charts/song.txt"),
@@ -100,6 +131,7 @@ class ReviewReportTests(unittest.TestCase):
                 ),
             ]
 
+            output = io.StringIO()
             with (
                 patch(
                     "sys.argv",
@@ -116,9 +148,19 @@ class ReviewReportTests(unittest.TestCase):
                     "analyze_chart_in_child_process",
                     side_effect=results,
                 ),
-                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stdout(output),
             ):
                 self.assertEqual(analysis.main(), 0)
+
+            console_output = output.getvalue()
+            self.assertIn(
+                "[1/3 Estimated End calculating] Analyzing:",
+                console_output,
+            )
+            self.assertRegex(
+                console_output,
+                r"\[2/3 Estimated End \d{2}:\d{2}\] Analyzing:",
+            )
 
             review_path = root / "gap_report_english_review.txt"
             review = review_path.read_text(encoding="utf-8")

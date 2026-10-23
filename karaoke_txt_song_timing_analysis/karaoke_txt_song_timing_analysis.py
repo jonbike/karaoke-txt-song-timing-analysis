@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib.metadata import version
 import math
 import multiprocessing
@@ -39,6 +39,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 
 from dataclasses import dataclass, field
@@ -78,6 +79,7 @@ HANGUL_RE = re.compile(
 )
 GAP_WINDOW_FALLBACK_SECONDS = 90.0
 MIN_USABLE_CHART_WORDS = 3
+ETA_SAMPLE_SIZE = 10
 
 
 @dataclass
@@ -202,6 +204,34 @@ def select_gap_opening_windows(
         max(audio_opening_seconds, GAP_WINDOW_FALLBACK_SECONDS),
         max(chart_opening_seconds, GAP_WINDOW_FALLBACK_SECONDS),
     )
+
+
+def estimate_completion_time(
+    song_durations: list[float],
+    remaining_songs: int,
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Estimate completion using the most recent completed song durations."""
+    if not song_durations:
+        return None
+
+    average_duration = statistics.fmean(song_durations[-ETA_SAMPLE_SIZE:])
+    return (now or datetime.now()) + timedelta(
+        seconds=average_duration * remaining_songs
+    )
+
+
+def format_estimated_end(
+    estimated_end: datetime,
+    now: Optional[datetime] = None,
+) -> str:
+    """Format an estimated end time with a day offset when needed."""
+    current_date = (now or datetime.now()).date()
+    days_ahead = (estimated_end.date() - current_date).days
+    if days_ahead == 0:
+        return estimated_end.strftime("%H:%M")
+    day_label = "day" if days_ahead == 1 else "days"
+    return f"+{days_ahead} {day_label} {estimated_end:%H:%M}"
 
 
 def prepare_audio_words_for_matching(
@@ -2235,8 +2265,22 @@ def main() -> int:
                 review_report_file.write(
                     "Songs with recommended GAP corrections of at least 1,000 ms\n\n"
                 )
+                song_durations: list[float] = []
                 for index, chart_path in enumerate(chart_paths, start=1):
-                    print(f"[{index}/{len(chart_paths)}] Analyzing: {chart_path}")
+                    estimated_end = estimate_completion_time(
+                        song_durations,
+                        len(chart_paths) - index + 1,
+                    )
+                    end_text = (
+                        format_estimated_end(estimated_end)
+                        if estimated_end is not None
+                        else "calculating"
+                    )
+                    print(
+                        f"[{index}/{len(chart_paths)} Estimated End {end_text}] "
+                        f"Analyzing: {chart_path}"
+                    )
+                    song_started_at = time.monotonic()
                     try:
                         result = analyze_chart_in_child_process(chart_path, args)
                     except Exception as exc:
@@ -2259,6 +2303,7 @@ def main() -> int:
                     review_report_file.write(format_review_report_entry(result))
                     report_file.flush()
                     review_report_file.flush()
+                    song_durations.append(time.monotonic() - song_started_at)
                     print(f"    {result.status}: {result.confidence}")
                     del result
     except OSError as exc:
