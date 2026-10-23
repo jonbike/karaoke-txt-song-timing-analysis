@@ -349,5 +349,116 @@ class AnalyzeChartWithDemucsTests(unittest.TestCase):
         self.assertFalse(temporary_stems[0].exists())
 
 
+class CpuFallbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.chart_path = Path("/charts/song.txt")
+        self.args = Namespace(
+            device="cuda",
+            compute_type="float16",
+            model="medium",
+            debug=False,
+        )
+
+    def make_result(self, status: str, reason: str) -> analysis.Analysis:
+        return analysis.Analysis(
+            chart_path=self.chart_path,
+            audio_path=Path("/audio/song.mp3"),
+            old_gap_ms=100,
+            bpm=120,
+            status=status,
+            reason=reason,
+        )
+
+    def test_retries_cuda_oom_on_cpu_without_changing_device_for_next_song(self) -> None:
+        next_chart = Path("/charts/next_song.txt")
+        gpu_failure = self.make_result(
+            "Analysis failed",
+            "OutOfMemoryError: CUDA out of memory. Tried to allocate 160 MiB.",
+        )
+        cpu_success = self.make_result("Analysis complete", "GAP estimated.")
+        next_song_success = analysis.Analysis(
+            chart_path=next_chart,
+            audio_path=Path("/audio/next_song.mp3"),
+            old_gap_ms=100,
+            bpm=120,
+            status="Analysis complete",
+        )
+        call_devices: list[tuple[Path, str, str]] = []
+
+        def analyze(path: Path, args: Namespace) -> analysis.Analysis:
+            call_devices.append((path, args.device, args.compute_type))
+            if path == self.chart_path and args.device == "cuda":
+                return gpu_failure
+            if path == self.chart_path:
+                return cpu_success
+            return next_song_success
+
+        with patch.object(
+            analysis,
+            "analyze_chart_in_child_process",
+            side_effect=analyze,
+        ):
+            retried_result = analysis.analyze_chart_with_cpu_fallback(
+                self.chart_path,
+                self.args,
+            )
+            next_result = analysis.analyze_chart_with_cpu_fallback(
+                next_chart,
+                self.args,
+            )
+
+        self.assertEqual(retried_result.status, "Analysis complete")
+        self.assertIn("succeeded on CPU retry", retried_result.reason)
+        self.assertEqual(next_result.status, "Analysis complete")
+        self.assertEqual(
+            call_devices,
+            [
+                (self.chart_path, "cuda", "float16"),
+                (self.chart_path, "cpu", "int8"),
+                (next_chart, "cuda", "float16"),
+            ],
+        )
+        self.assertEqual(self.args.device, "cuda")
+        self.assertEqual(self.args.compute_type, "float16")
+
+    def test_does_not_retry_non_oom_failures(self) -> None:
+        failure = self.make_result("Analysis failed", "WhisperX model not found.")
+
+        with patch.object(
+            analysis,
+            "analyze_chart_in_child_process",
+            return_value=failure,
+        ) as analyze:
+            result = analysis.analyze_chart_with_cpu_fallback(
+                self.chart_path,
+                self.args,
+            )
+
+        self.assertIs(result, failure)
+        analyze.assert_called_once_with(self.chart_path, self.args)
+
+    def test_reports_gpu_and_cpu_errors_when_cpu_retry_fails(self) -> None:
+        gpu_failure = self.make_result(
+            "Analysis failed",
+            "CUDA out of memory.",
+        )
+        cpu_failure = self.make_result(
+            "Analysis failed",
+            "CPU transcription failed.",
+        )
+        with patch.object(
+            analysis,
+            "analyze_chart_in_child_process",
+            side_effect=(gpu_failure, cpu_failure),
+        ):
+            result = analysis.analyze_chart_with_cpu_fallback(
+                self.chart_path,
+                self.args,
+            )
+
+        self.assertIn("GPU error: CUDA out of memory.", result.reason)
+        self.assertIn("CPU error: CPU transcription failed.", result.reason)
+
+
 if __name__ == "__main__":
     unittest.main()

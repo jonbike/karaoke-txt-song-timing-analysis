@@ -1650,6 +1650,64 @@ def analyze_chart_in_child_process(
     return result
 
 
+def is_cuda_out_of_memory(reason: str) -> bool:
+    """Return whether a failure reason explicitly reports CUDA OOM."""
+    normalized_reason = reason.casefold()
+    return (
+        "cuda out of memory" in normalized_reason
+        or "cuda error: out of memory" in normalized_reason
+        or (
+            "outofmemoryerror" in normalized_reason
+            and "cuda" in normalized_reason
+        )
+    )
+
+
+def analyze_chart_with_cpu_fallback(
+    chart_path: Path,
+    args: argparse.Namespace,
+) -> Analysis:
+    """Retry a CUDA out-of-memory failure once on CPU for this chart."""
+    result = analyze_chart_in_child_process(chart_path, args)
+    if (
+        args.device != "cuda"
+        or result.status != "Analysis failed"
+        or not is_cuda_out_of_memory(result.reason)
+    ):
+        return result
+
+    print(
+        f"    CUDA out of memory; retrying on CPU: {chart_path.name}",
+        flush=True,
+    )
+    cpu_args = argparse.Namespace(**vars(args))
+    cpu_args.device = "cpu"
+    cpu_args.compute_type = "int8"
+    try:
+        cpu_result = analyze_chart_in_child_process(chart_path, cpu_args)
+    except Exception as exc:
+        raise RuntimeError(
+            "CUDA out-of-memory attempt failed.\n"
+            f"GPU error: {result.reason}\n"
+            "CPU retry could not complete: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    if cpu_result.status == "Analysis failed":
+        cpu_result.reason = (
+            "GPU attempt failed with CUDA out of memory.\n"
+            f"GPU error: {result.reason}\n"
+            "CPU retry also failed.\n"
+            f"CPU error: {cpu_result.reason}"
+        )
+    else:
+        cpu_result.reason = (
+            f"{cpu_result.reason}\n"
+            "GPU attempt ran out of memory; analysis succeeded on CPU retry."
+        ).strip()
+    return cpu_result
+
+
 def write_gap_update(result: Analysis) -> str:
     """Back up a chart and atomically write a confident GAP suggestion."""
     if result.confidence not in {"High", "Medium"}:
@@ -2282,7 +2340,7 @@ def main() -> int:
                     )
                     song_started_at = time.monotonic()
                     try:
-                        result = analyze_chart_in_child_process(chart_path, args)
+                        result = analyze_chart_with_cpu_fallback(chart_path, args)
                     except Exception as exc:
                         result = Analysis(
                             chart_path=chart_path,

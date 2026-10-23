@@ -38,7 +38,9 @@ not silently fall back to transcribing the original mix.
 With the default `--bpm off`, `ffmpeg` is also used to make a temporary,
 stream-copied clip one second longer than the selected opening window before
 Demucs runs. With `--bpm on`, Demucs receives the full audio so later BPM
-samples remain available.
+samples remain available. If a song fails with a CUDA out-of-memory error
+while CUDA is selected, that song is retried once using CPU and `int8`; the
+next song still uses the originally selected device.
 
 When WhisperX detects Korean and chart lyrics contain no Hangul, aligned
 Whisper words are romanized using Revised Romanization for lyric matching.
