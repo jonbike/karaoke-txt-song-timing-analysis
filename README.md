@@ -35,6 +35,10 @@ analysis (`cpu` by default, or `cuda` when requested). It writes its
 `vocals.wav` stem to an isolated temporary directory; that directory is
 removed after the song has been analyzed. Demucs failures are reported and do
 not silently fall back to transcribing the original mix.
+With the default `--bpm off`, `ffmpeg` is also used to make a temporary,
+stream-copied clip one second longer than the selected opening window before
+Demucs runs. With `--bpm on`, Demucs receives the full audio so later BPM
+samples remain available.
 
 When WhisperX detects Korean and chart lyrics contain no Hangul, aligned
 Whisper words are romanized using Revised Romanization for lyric matching.
@@ -129,8 +133,10 @@ modified. Review the report and keep backups before enabling chart updates.
   informative chart words (at least three characters each) fall in both
   initial windows, or the first lyric is expected in the latter half of the
   audio window, both windows extend to 90 seconds. Explicitly configured
-  windows longer than 90 seconds are preserved. It does not transcribe the
-  entire song for this estimate.
+  windows longer than 90 seconds are preserved. When BPM verification is off,
+  Demucs is run on a temporary audio clip one second longer than the selected
+  audio window; with `--bpm on`, it uses the full audio to allow later samples.
+  It does not transcribe the entire song for the GAP estimate.
 - Charts without a valid BPM, GAP, lyric timings, or matching audio cannot
   produce a GAP suggestion. The report records the reason.
 - BPM verification is disabled by default. Enable it with `--bpm on`; it

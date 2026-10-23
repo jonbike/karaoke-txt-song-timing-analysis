@@ -1156,6 +1156,35 @@ def separate_vocals(
     return vocal_stems[0]
 
 
+def create_audio_snippet(
+    audio_path: Path,
+    duration_seconds: float,
+    output_directory: Path,
+) -> Path:
+    """Create a stream-copied audio snippet for opening-window analysis."""
+    snippet_path = output_directory / (
+        f"{audio_path.stem}_{duration_seconds:g}s{audio_path.suffix}"
+    )
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-i",
+            str(audio_path),
+            "-t",
+            f"{duration_seconds:g}",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "copy",
+            str(snippet_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return snippet_path
+
+
 def analyze_chart(
     chart_path: Path,
     args: argparse.Namespace,
@@ -1171,17 +1200,36 @@ def analyze_chart(
     ):
         return _analyze_chart_with_audio(chart_path, args)
 
+    opening_windows = select_gap_opening_windows(
+        chart_words,
+        args.audio_opening_seconds,
+        args.chart_opening_seconds,
+        gap_ms,
+    )
+    audio_opening_seconds, _ = opening_windows
+
     with tempfile.TemporaryDirectory(prefix="karaoke-demucs-") as temporary:
         try:
+            demucs_input_path = audio_path
+            if args.bpm == "off":
+                demucs_input_path = create_audio_snippet(
+                    audio_path,
+                    audio_opening_seconds + 1.0,
+                    Path(temporary),
+                )
+            print(f"    Demucs processing: {chart_path.name}", flush=True)
             vocals_path = separate_vocals(
-                audio_path,
+                demucs_input_path,
                 args.device,
                 Path(temporary),
             )
         except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
-            reason = f"Demucs vocal separation failed: {type(exc).__name__}: {exc}"
+            reason = (
+                "Audio preparation or Demucs vocal separation failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
             if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
-                reason += f"\nDemucs stderr: {exc.stderr.strip()}"
+                reason += f"\nCommand stderr: {exc.stderr.strip()}"
             if args.debug:
                 reason += "\n" + traceback.format_exc()
             return Analysis(
@@ -1198,6 +1246,7 @@ def analyze_chart(
             chart_path,
             args,
             transcription_audio_path=vocals_path,
+            opening_windows=opening_windows,
         )
 
 
@@ -1205,6 +1254,7 @@ def _analyze_chart_with_audio(
     chart_path: Path,
     args: argparse.Namespace,
     transcription_audio_path: Optional[Path] = None,
+    opening_windows: Optional[tuple[float, float]] = None,
 ) -> Analysis:
     gap_ms, bpm, chart_words = parse_chart(chart_path)
     unknown_note_types = detect_unknown_note_types(chart_path)
@@ -1249,12 +1299,14 @@ def _analyze_chart_with_audio(
 
     transcription_audio_path = transcription_audio_path or audio_path
 
-    audio_opening_seconds, chart_opening_seconds = select_gap_opening_windows(
-        chart_words,
-        args.audio_opening_seconds,
-        args.chart_opening_seconds,
-        gap_ms,
-    )
+    if opening_windows is None:
+        opening_windows = select_gap_opening_windows(
+            chart_words,
+            args.audio_opening_seconds,
+            args.chart_opening_seconds,
+            gap_ms,
+        )
+    audio_opening_seconds, chart_opening_seconds = opening_windows
     analysis.audio_opening_seconds = audio_opening_seconds
     analysis.chart_opening_seconds = chart_opening_seconds
 
@@ -1275,6 +1327,7 @@ def _analyze_chart_with_audio(
         return analysis
 
     try:
+        print(f"    WhisperX processing: {chart_path.name}", flush=True)
         (
             opening_audio_words,
             duration,
@@ -1412,6 +1465,10 @@ def _analyze_chart_with_audio(
         sample_transcriptions: dict[str, str] = {}
         if extra_windows:
             try:
+                print(
+                    f"    WhisperX processing BPM samples: {chart_path.name}",
+                    flush=True,
+                )
                 (
                     _,
                     _,
