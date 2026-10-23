@@ -148,4 +148,6 @@ modified. Review the report and keep backups before enabling chart updates.
 - Charts without a valid BPM, GAP, lyric timings, or matching audio cannot
   produce a GAP suggestion. The report records the reason.
 - BPM verification is disabled by default. Enable it with `--bpm on`; it
-  samples selected sections rather than transcribing the entire song.
+  samples selected sections rather than transcribing the entire song. Its
+  beginning sample reuses the opening GAP matches, while middle/end samples use
+  separately selected lyric sections.

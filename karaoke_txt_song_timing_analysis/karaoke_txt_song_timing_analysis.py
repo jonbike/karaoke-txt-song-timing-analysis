@@ -1458,26 +1458,20 @@ def _analyze_chart_with_audio(
             f"(language: {detected_language}); no Beginning BPM sample is available."
         )
 
-    # Beginning sample comes from the existing opening match, limited to the
-    # first 24 chart seconds so it represents one region rather than the whole
-    # opening alignment.
+    # Reuse the opening GAP matches as the first BPM sample; do not transcribe
+    # the opening region again just to create a separate BPM sample.
     if chart_words:
-        beginning_limit = chart_words[0].seconds + 24.0
-        beginning_matches = [m for m in matches if m.chart.seconds <= beginning_limit]
+        beginning_matches = matches
         beginning_sample = summarize_bpm_sample("Beginning", beginning_matches)
         bpm_samples: list[BpmSample] = []
         if beginning_sample:
             bpm_samples.append(beginning_sample)
-        beginning_chart_words = [
-            word for word in chart_words
-            if word.seconds <= beginning_limit
-        ]
         analysis.bpm_sample_diagnostics.append(
             BpmSampleDiagnostic(
                 label="Beginning",
                 audio_start=0.0,
                 audio_end=min(duration, audio_opening_seconds),
-                chart_words=beginning_chart_words,
+                chart_words=opening_chart_words,
                 transcription=opening_transcriptions.get("opening", ""),
                 aligned_words=opening_audio_words,
                 matches=beginning_matches,
