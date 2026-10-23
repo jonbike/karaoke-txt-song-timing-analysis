@@ -36,6 +36,8 @@ analysis (`cpu` by default, or `cuda` when requested). It writes its
 `vocals.wav` stem to an isolated temporary directory; that directory is
 removed after the song has been analyzed. Demucs failures are reported and do
 not silently fall back to transcribing the original mix.
+The WhisperX transcription model is loaded once per song and reused for its
+opening and optional later BPM windows.
 With the default `--bpm off`, `ffmpeg` is also used to make a temporary,
 stream-copied clip one second longer than the selected opening window before
 Demucs runs. With `--bpm on`, Demucs receives the full audio so later BPM
@@ -112,6 +114,7 @@ chart's `#GAP` write attempt.
 | `--model` | `medium` | WhisperX model name. |
 | `--device` | `cpu` | Inference device: `cpu` or `cuda`. |
 | `--compute-type` | Device-dependent | WhisperX compute type; defaults to `int8` on CPU and `float16` on CUDA. |
+| `--batch-size` | `4` | WhisperX transcription batch size. Choose `4`, `8`, `16`, `32`, or `64`; larger batches use more memory. |
 | `--match-threshold` | `0.55` | Minimum fuzzy word similarity from 0 to 1. Lower values allow less-exact matches. |
 | `--audio-opening-seconds` | `60` | Minimum opening audio window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
 | `--chart-opening-seconds` | `60` | Minimum chart opening window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |

@@ -123,6 +123,7 @@ class ChartWriteTests(unittest.TestCase):
         args = analysis.argparse.Namespace(
             report_level="summary",
             match_threshold=0.55,
+            batch_size=4,
             audio_opening_seconds=60,
             chart_opening_seconds=60,
             bpm="on",
@@ -132,6 +133,7 @@ class ChartWriteTests(unittest.TestCase):
 
         report = analysis.format_summary_report([result], args)
 
+        self.assertIn("WhisperX batch size: 4", report)
         self.assertIn("Suggested #BPM: 120.125", report)
         self.assertIn("#BPM write: Updated #BPM from 120 to 120.125.", report)
 

@@ -1,7 +1,7 @@
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 from pathlib import Path
-from unittest.mock import patch
 
 from karaoke_txt_song_timing_analysis import karaoke_txt_song_timing_analysis as analysis
 
@@ -32,6 +32,7 @@ class BpmEstimationTests(unittest.TestCase):
             language=None,
             device="cpu",
             compute_type="int8",
+            batch_size=4,
             match_threshold=0.55,
             max_correction_ms=15000,
             bpm="on",
@@ -59,6 +60,7 @@ class BpmEstimationTests(unittest.TestCase):
                         "en",
                         {},
                         {"opening": "opening"},
+                        object(),
                     ),
                 ),
                 patch.object(analysis, "prepare_audio_words_for_matching", return_value=[]),
@@ -76,6 +78,48 @@ class BpmEstimationTests(unittest.TestCase):
         self.assertEqual(result.bpm_samples[0].match_count, 3)
         self.assertEqual(result.bpm_samples[0].chart_time_seconds, 41)
         self.assertEqual(result.bpm_sample_diagnostics[0].matches, matches)
+
+    def test_transcription_passes_configured_batch_size_to_whisperx(self) -> None:
+        whisperx = MagicMock()
+        whisperx.load_audio.return_value = [0.0] * (60 * 16000)
+        model = whisperx.load_model.return_value
+        model.transcribe.return_value = {
+            "language": "en",
+            "segments": [],
+            "text": "hello",
+        }
+
+        with patch.dict("sys.modules", {"whisperx": whisperx}):
+            opening_result = analysis.transcribe_audio_windows(
+                audio_path=Path("/audio/song.wav"),
+                model_name="medium",
+                language="en",
+                device="cuda",
+                compute_type="float16",
+                batch_size=16,
+                opening_seconds=1,
+                extra_windows=[],
+            )
+            analysis.transcribe_audio_windows(
+                audio_path=Path("/audio/song.wav"),
+                model_name="medium",
+                language="en",
+                device="cuda",
+                compute_type="float16",
+                batch_size=16,
+                opening_seconds=0,
+                extra_windows=[("Middle", 10, 5)],
+                model=opening_result[6],
+            )
+
+        whisperx.load_model.assert_called_once()
+        self.assertEqual(model.transcribe.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["batch_size"] == 16
+                for call in model.transcribe.call_args_list
+            )
+        )
 
     def test_three_qualified_samples_can_receive_high_confidence(self) -> None:
         samples = [

@@ -270,6 +270,7 @@ class AnalyzeChartWithDemucsTests(unittest.TestCase):
             chart_opening_seconds=60,
             device="cpu",
             compute_type="int8",
+            batch_size=4,
             model="medium",
             language="en",
             bpm="off",
@@ -288,7 +289,7 @@ class AnalyzeChartWithDemucsTests(unittest.TestCase):
             patch.object(
                 analysis,
                 "transcribe_audio_windows",
-                return_value=([], 120.0, "", "en", {}, {"opening": ""}),
+                return_value=([], 120.0, "", "en", {}, {"opening": ""}, object()),
             ),
             patch("builtins.print") as print_output,
         ):

@@ -44,7 +44,7 @@ import traceback
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from korean_romanizer import Romanizer
 
@@ -545,8 +545,10 @@ def transcribe_audio_windows(
     language: Optional[str],
     device: str,
     compute_type: str,
+    batch_size: int,
     opening_seconds: float,
     extra_windows: list[tuple[str, float, float]],
+    model: Optional[Any] = None,
 ) -> tuple[
     list[AudioWord],
     float,
@@ -554,8 +556,9 @@ def transcribe_audio_windows(
     Optional[str],
     dict[str, list[AudioWord]],
     dict[str, str],
+    Any,
 ]:
-    """Transcribe the opening plus selected later windows, loading models once.
+    """Transcribe windows, optionally reusing a model loaded by an earlier call.
 
     Extra windows are (label, start_seconds, duration_seconds). Their timestamps
     are converted back to absolute audio time so they can be compared directly
@@ -593,12 +596,13 @@ def transcribe_audio_windows(
             )
         )
 
-    model = whisperx.load_model(
-        model_name,
-        device,
-        compute_type=compute_type,
-        language=language,
-    )
+    if model is None:
+        model = whisperx.load_model(
+            model_name,
+            device,
+            compute_type=compute_type,
+            language=language,
+        )
 
     raw_windows: list[tuple[str, float, object, dict]] = []
     detected_language = language
@@ -606,7 +610,7 @@ def transcribe_audio_windows(
     for index, (label, start, chunk) in enumerate(windows):
         result = model.transcribe(
             chunk,
-            batch_size=4,
+            batch_size=batch_size,
             language=language,
         )
         if not isinstance(result, dict):
@@ -701,6 +705,7 @@ def transcribe_audio_windows(
             label: data["text"]
             for label, _, _, data in raw_windows
         },
+        model,
     )
 
 
@@ -1371,12 +1376,14 @@ def _analyze_chart_with_audio(
             detected_language,
             _,
             opening_transcriptions,
+            transcription_model,
         ) = transcribe_audio_windows(
             audio_path=transcription_audio_path,
             model_name=args.model,
             language=args.language,
             device=args.device,
             compute_type=args.compute_type,
+            batch_size=args.batch_size,
             opening_seconds=audio_opening_seconds,
             extra_windows=[],
         )
@@ -1506,14 +1513,17 @@ def _analyze_chart_with_audio(
                     _,
                     transcribed_windows,
                     sample_transcriptions,
+                    _,
                 ) = transcribe_audio_windows(
                     audio_path=transcription_audio_path,
                     model_name=args.model,
                     language=detected_language,
                     device=args.device,
                     compute_type=args.compute_type,
+                    batch_size=args.batch_size,
                     opening_seconds=0,
                     extra_windows=extra_windows,
+                    model=transcription_model,
                 )
             except Exception as exc:
                 analysis.bpm_sample_notes.append(
@@ -1978,6 +1988,7 @@ def format_summary_report(
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
             f"Match threshold: {args.match_threshold:.2f}",
+            f"WhisperX batch size: {args.batch_size}",
             f"Initial audio opening window: {args.audio_opening_seconds:.1f} seconds",
             f"Initial chart opening window: {args.chart_opening_seconds:.1f} seconds",
             "",
@@ -2088,6 +2099,7 @@ def format_report(
                 )
             ),
             f"Match threshold: {args.match_threshold:.2f}",
+            f"WhisperX batch size: {args.batch_size}",
             f"Initial audio opening window: {args.audio_opening_seconds:.1f} seconds",
             f"Initial chart opening window: {args.chart_opening_seconds:.1f} seconds",
             "BPM verification can sample later sections without transcribing the full song.",
@@ -2372,6 +2384,13 @@ def main() -> int:
         "--compute-type",
         default=None,
         help="WhisperX compute type; defaults to int8 on CPU and float16 on CUDA.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        choices=(4, 8, 16, 32, 64),
+        default=4,
+        help="WhisperX transcription batch size (choices: 4, 8, 16, 32, 64; default: 4).",
     )
     parser.add_argument(
         "--match-threshold",
