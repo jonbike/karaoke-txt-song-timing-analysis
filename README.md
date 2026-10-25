@@ -93,10 +93,11 @@ includes each chart's current and suggested `#GAP`, match confidence, analysis
 details, and any reason a suggestion was withheld or a chart could not be
 analyzed. A companion report with `_review` appended to the filename is also
 created or overwritten (for example, `gap_report.txt` produces
-`gap_report_review.txt`). It lists only eligible Medium/High GAP suggestions
-whose absolute correction is at least 1,000 ms, with the audio path, correction,
-and confidence. Both reports are updated after each song is processed. The
-command also prints progress and both report locations to the terminal.
+`gap_report_review.txt`). It lists eligible Medium/High GAP suggestions whose
+absolute correction is at least 1,000 ms, and also includes every song that
+triggers the opening timing-drift warning described below. Both reports are
+updated after each song is processed. The command also prints progress and
+both report locations to the terminal.
 
 Use `--report-level summary` to write only the key settings and per-chart
 results. The default `--report-level all` keeps the detailed report. When
@@ -136,6 +137,28 @@ options are enabled, eligible values are written together from one chart
 snapshot. Before changing a chart, the tool refreshes a sibling backup named
 `<chart-stem>.bak` (for example, `song.bak` for `song.txt`). Audio files are never
 modified. Review the report and keep backups before enabling chart updates.
+
+## How GAP estimates handle outliers
+
+The GAP estimate is the median of the timing offsets from accepted ordered
+lyric matches. Each accepted match contributes equally: similarity is used to
+decide whether a match meets `--match-threshold`, not to give its timing more
+or less weight. Matches are not discarded just because their offsets are far
+from the median. The median limits the influence of a small minority of
+outliers, while the median absolute deviation (MAD) describes how spread out
+the offsets are and contributes to the confidence rating. A high MAD can
+therefore make a result Low confidence and prevent it from being recommended
+or written, even though the median still provides a diagnostic estimate.
+
+The report also warns when at least 10 opening matches spanning at least 20
+chart seconds show a Theil-Sen offset trend of at least 1,000 ms across that
+span, with trend-fit residual MAD no greater than 1,000 ms. This can indicate
+BPM drift is affecting the GAP estimate. The warning is diagnostic only: it
+does not change the GAP estimate, confidence, or write eligibility. The
+companion `_review` report includes every song with this warning, even if its
+GAP correction would not otherwise qualify for that report. This warning is
+covered by a regression test using a real opening-match example with a
+localized outlier.
 
 ## Limitations
 

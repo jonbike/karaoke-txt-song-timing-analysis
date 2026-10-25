@@ -85,6 +85,10 @@ HANGUL_RE = re.compile(
 GAP_WINDOW_FALLBACK_SECONDS = 90.0
 MIN_USABLE_CHART_WORDS = 3
 ETA_SAMPLE_SIZE = 10
+MIN_GAP_DRIFT_MATCHES = 10
+MIN_GAP_DRIFT_SPAN_SECONDS = 20.0
+MIN_GAP_DRIFT_MS = 1000.0
+MAX_GAP_DRIFT_RESIDUAL_MAD_MS = 1000.0
 
 
 @dataclass
@@ -149,6 +153,7 @@ class Analysis:
     correction_ms: Optional[float] = None
     confidence: str = "Not assessed"
     reason: str = ""
+    gap_drift_warning: str = ""
     audio_duration: Optional[float] = None
     audio_opening_seconds: Optional[float] = None
     chart_opening_seconds: Optional[float] = None
@@ -954,6 +959,51 @@ def median_absolute_deviation(values: list[float]) -> float:
     return statistics.median(abs(x - median) for x in values)
 
 
+def detect_gap_drift_warning(matches: list[Match]) -> str:
+    """Flag a sustained opening offset trend that may confound the GAP estimate."""
+    if len(matches) < MIN_GAP_DRIFT_MATCHES:
+        return ""
+
+    chart_times = [match.chart.seconds for match in matches]
+    chart_span = max(chart_times) - min(chart_times)
+    if chart_span < MIN_GAP_DRIFT_SPAN_SECONDS:
+        return ""
+
+    slopes = [
+        (second.gap_ms - first.gap_ms)
+        / (second.chart.seconds - first.chart.seconds)
+        for index, first in enumerate(matches)
+        for second in matches[index + 1:]
+        if second.chart.seconds != first.chart.seconds
+    ]
+    if not slopes:
+        return ""
+
+    slope_ms_per_second = statistics.median(slopes)
+    trend_ms = slope_ms_per_second * chart_span
+    intercept_ms = statistics.median(
+        match.gap_ms - slope_ms_per_second * match.chart.seconds
+        for match in matches
+    )
+    residual_mad_ms = median_absolute_deviation([
+        match.gap_ms - (
+            intercept_ms + slope_ms_per_second * match.chart.seconds
+        )
+        for match in matches
+    ])
+    if (
+        abs(trend_ms) < MIN_GAP_DRIFT_MS
+        or residual_mad_ms > MAX_GAP_DRIFT_RESIDUAL_MAD_MS
+    ):
+        return ""
+
+    return (
+        f"Opening match offsets show a sustained {trend_ms:+.0f} ms trend "
+        f"over {chart_span:.1f} seconds; a BPM mismatch may be affecting "
+        "the GAP estimate. Review before accepting or writing."
+    )
+
+
 def evaluate_matches(
     matches: list[Match],
     old_gap_ms: float,
@@ -1433,6 +1483,7 @@ def _analyze_chart_with_audio(
     analysis.correction_ms = correction
     analysis.confidence = confidence
     analysis.reason = reason
+    analysis.gap_drift_warning = detect_gap_drift_warning(matches)
     if not opening_audio_words:
         analysis.reason = (
             f"No aligned opening audio word timestamps were returned "
@@ -2040,6 +2091,8 @@ def format_summary_report(
             f"Confidence: {result.confidence}",
             f"Reason: {(result.reason or 'No additional details').splitlines()[0]}",
         ])
+        if result.gap_drift_warning:
+            lines.append(f"Warning: {result.gap_drift_warning}")
         if args.bpm == "on":
             if (
                 result.suggested_bpm is not None
@@ -2152,6 +2205,8 @@ def format_report(
             f"Confidence: {result.confidence}",
             f"Reason: {result.reason or 'No additional details'}",
         ])
+        if result.gap_drift_warning:
+            lines.append(f"Warning: {result.gap_drift_warning}")
         if args.write_gap:
             lines.append(f"#GAP write: {result.gap_write_status}")
         if args.write_bpm:
@@ -2323,21 +2378,26 @@ def format_report(
 
 
 def format_review_report_entry(result: Analysis) -> str:
-    if (
-        result.audio_path is None
-        or result.suggested_gap_ms is None
-        or result.correction_ms is None
-        or not math.isfinite(result.correction_ms)
-        or abs(result.correction_ms) < 1000
-        or result.confidence not in {"High", "Medium"}
-    ):
+    eligible_gap = (
+        result.audio_path is not None
+        and result.suggested_gap_ms is not None
+        and result.correction_ms is not None
+        and math.isfinite(result.correction_ms)
+        and abs(result.correction_ms) >= 1000
+        and result.confidence in {"High", "Medium"}
+    )
+    if not eligible_gap and not result.gap_drift_warning:
         return ""
 
-    return "\n".join([
-        f"Audio: {result.audio_path}",
-        f"GAP Correction: {result.correction_ms:+.0f} ms",
-        f"Confidence: {result.confidence}",
-    ]) + "\n\n"
+    lines = [f"Audio: {result.audio_path or 'Not found'}"]
+    if eligible_gap:
+        lines.extend([
+            f"GAP Correction: {result.correction_ms:+.0f} ms",
+            f"Confidence: {result.confidence}",
+        ])
+    if result.gap_drift_warning:
+        lines.append(f"Warning: {result.gap_drift_warning}")
+    return "\n".join(lines) + "\n\n"
 
 
 def main() -> int:
@@ -2515,7 +2575,8 @@ def main() -> int:
             with review_report_path.open("w", encoding="utf-8") as review_report_file:
                 report_file.write(format_report([], args))
                 review_report_file.write(
-                    "Songs with recommended GAP corrections of at least 1,000 ms\n\n"
+                    "Songs with recommended GAP corrections of at least 1,000 ms "
+                    "or a possible opening timing-drift warning\n\n"
                 )
                 song_durations: list[float] = []
                 for index, chart_path in enumerate(chart_paths, start=1):

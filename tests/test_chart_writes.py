@@ -43,6 +43,9 @@ class ChartWriteTests(unittest.TestCase):
                 status="Analyzed",
                 suggested_gap_ms=250,
                 confidence="High",
+                gap_drift_warning=(
+                    "Opening match offsets show a sustained -2,750 ms trend."
+                ),
                 suggested_bpm=121.25,
                 bpm_confidence="Medium",
             )

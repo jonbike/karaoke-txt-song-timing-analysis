@@ -100,8 +100,21 @@ outcomes clear.
 
    `audio word start - chart word time`
 
-   The GAP estimate is the median match offset. Report the number and quality
-   of matches, timing spread, confidence, and reason a result is withheld.
+   The GAP estimate is the median of all accepted ordered-match offsets.
+   Matches contribute equally; similarity determines whether a match meets
+   the threshold, but does not weight its timing offset. Do not discard
+   matches solely because their offsets are far from the median. The median
+   limits the influence of a small minority of outliers, while the median
+   absolute deviation (MAD) reports offset spread and contributes to
+   confidence. Report the number and quality of matches, timing spread,
+   confidence, and reason a result is withheld.
+   Also issue a diagnostic warning when at least 10 opening matches spanning
+   at least 20 chart seconds show a Theil-Sen offset trend of at least
+   1000 ms across the span, with trend-fit residual MAD no greater than
+   1000 ms. The warning indicates that BPM drift may be affecting the GAP
+   estimate; it must not change the estimate, confidence, or write eligibility.
+   Include all warned songs in the companion review report, even when they
+   would not otherwise meet its GAP-correction inclusion criteria.
 5. The default match threshold is `0.55`. A proposed absolute correction above
    `--max-correction-ms` (default `15000`) is Low confidence and is withheld
    from normal GAP recommendations.
@@ -176,8 +189,9 @@ outcomes clear.
 3. Create or overwrite the requested report and a companion review report
    whose name adds `_review` before the extension. Update both after each
    chart, so progress is retained if later work fails.
-4. The review report includes only eligible Medium/High GAP suggestions whose
-   absolute correction is at least 1000 ms.
+4. The review report includes eligible Medium/High GAP suggestions whose
+   absolute correction is at least 1000 ms, and every chart that triggers the
+   opening timing-drift warning, regardless of GAP suggestion eligibility.
 5. Include current and suggested values, confidence, reasons, BPM sample
    details when enabled, and the result of each requested chart write.
    Summary reports must retain write outcomes and key BPM information when
@@ -220,6 +234,10 @@ A change conforms to this specification when:
   this document and its related user documentation.
 - GAP and BPM behavior is tested against their measured thresholds and
   decision boundaries, including withheld and diagnostic-only cases.
+- Opening timing-drift warning behavior is tested at its thresholds, with an
+  isolated-outlier negative case and a regression case based on real match
+  data; warned charts are verified to appear in the companion review report
+  without changing GAP confidence or write eligibility.
 - WhisperX calls use the configured model, device, compute type, language, and
   batch size; one model instance is reused for all transcription windows
   within a song.

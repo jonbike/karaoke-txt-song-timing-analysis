@@ -128,6 +128,9 @@ class ReviewReportTests(unittest.TestCase):
                     suggested_gap_ms=None,
                     correction_ms=2000,
                     confidence="Low",
+                    gap_drift_warning=(
+                        "Opening match offsets show a sustained -2,750 ms trend."
+                    ),
                 ),
             ]
 
@@ -168,7 +171,8 @@ class ReviewReportTests(unittest.TestCase):
             self.assertIn("GAP Correction: +1200 ms", review)
             self.assertIn("Confidence: High", review)
             self.assertNotIn("song_1.mp3", review)
-            self.assertNotIn("song_2.mp3", review)
+            self.assertIn("Audio: /audio/song_2.mp3", review)
+            self.assertIn("sustained -2,750 ms trend", review)
             self.assertTrue(report_path.exists())
 
 
