@@ -113,15 +113,15 @@ class ChartWriteTests(unittest.TestCase):
             chart_path=Path("/charts/song.txt"),
             audio_path=Path("/audio/song.mp3"),
             old_gap_ms=100,
-            bpm=120,
+            bpm=312,
             status="Analyzed",
             suggested_gap_ms=100,
             correction_ms=0,
             confidence="High",
-            suggested_bpm=120.125,
-            bpm_correction=0.125,
+            suggested_bpm=333.152,
+            bpm_correction=21.152,
             bpm_confidence="High",
-            bpm_write_status="Updated #BPM from 120 to 120.125.",
+            bpm_write_status="Updated #BPM from 312 to 333.152.",
         )
         args = analysis.argparse.Namespace(
             report_level="summary",
@@ -137,8 +137,45 @@ class ChartWriteTests(unittest.TestCase):
         report = analysis.format_summary_report([result], args)
 
         self.assertIn("WhisperX batch size: 4", report)
-        self.assertIn("Suggested #BPM: 120.125", report)
-        self.assertIn("#BPM write: Updated #BPM from 120 to 120.125.", report)
+        self.assertIn("Suggested #BPM: 333.152", report)
+        self.assertIn("BPM change: +6.78% (increase chart tempo)", report)
+        self.assertIn("#BPM write: Updated #BPM from 312 to 333.152.", report)
+
+        detailed_args = analysis.argparse.Namespace(**vars(args))
+        detailed_args.report_level = "all"
+        detailed_report = analysis.format_report([result], detailed_args)
+        self.assertIn("BPM change: +6.78% (increase chart tempo)", detailed_report)
+
+        diagnostic_result = analysis.Analysis(
+            chart_path=result.chart_path,
+            audio_path=result.audio_path,
+            old_gap_ms=result.old_gap_ms,
+            bpm=312,
+            status="Analyzed",
+            suggested_bpm=290,
+            bpm_correction=-22,
+            bpm_confidence="Low",
+        )
+        diagnostic_report = analysis.format_summary_report(
+            [diagnostic_result],
+            args,
+        )
+        self.assertIn(
+            "BPM change (diagnostic only): -7.05% (decrease chart tempo)",
+            diagnostic_report,
+        )
+
+    def test_bpm_change_format_uses_signed_percent_and_chart_direction(self) -> None:
+        self.assertEqual(
+            analysis.format_bpm_change(100, 20),
+            "BPM change: +20.00% (increase chart tempo)",
+        )
+        self.assertEqual(
+            analysis.format_bpm_change(100, -20, diagnostic_only=True),
+            "BPM change (diagnostic only): -20.00% (decrease chart tempo)",
+        )
+        self.assertIsNone(analysis.format_bpm_change(None, 20))
+        self.assertIsNone(analysis.format_bpm_change(0, 20))
 
     def test_write_bpm_requires_bpm_analysis(self) -> None:
         stderr = io.StringIO()

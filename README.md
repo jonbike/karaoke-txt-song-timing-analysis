@@ -138,6 +138,13 @@ snapshot. Before changing a chart, the tool refreshes a sibling backup named
 `<chart-stem>.bak` (for example, `song.bak` for `song.txt`). Audio files are never
 modified. Review the report and keep backups before enabling chart updates.
 
+When a BPM correction is available, reports also show its signed percentage
+relative to the current BPM: `(suggested BPM - current BPM) / current BPM ×
+100`. A positive percentage means an increase to the chart tempo; a negative
+percentage means a decrease. This describes the suggested chart `#BPM` change,
+not a change to the audio playback speed. Diagnostic-only estimates are
+labeled accordingly.
+
 ## How GAP estimates handle outliers
 
 The GAP estimate is the median of the timing offsets from accepted ordered

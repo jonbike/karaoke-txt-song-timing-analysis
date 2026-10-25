@@ -2026,6 +2026,32 @@ def format_ms(value: Optional[float]) -> str:
     return f"{value:.0f} ms"
 
 
+def format_bpm_change(
+    current_bpm: Optional[float],
+    correction: Optional[float],
+    diagnostic_only: bool = False,
+) -> Optional[str]:
+    if (
+        current_bpm is None
+        or correction is None
+        or not math.isfinite(current_bpm)
+        or current_bpm <= 0
+        or not math.isfinite(correction)
+    ):
+        return None
+
+    change_percent = correction / current_bpm * 100
+    direction = (
+        "increase chart tempo"
+        if change_percent > 0
+        else "decrease chart tempo"
+        if change_percent < 0
+        else "no chart-tempo change"
+    )
+    label = "BPM change (diagnostic only)" if diagnostic_only else "BPM change"
+    return f"{label}: {change_percent:+.2f}% ({direction})"
+
+
 def format_summary_report(
     results: list[Analysis],
     args: argparse.Namespace,
@@ -2104,6 +2130,12 @@ def format_summary_report(
                     f"BPM correction: {result.bpm_correction:+.3f}",
                     f"BPM confidence: {result.bpm_confidence}",
                 ])
+                bpm_change = format_bpm_change(
+                    result.bpm,
+                    result.bpm_correction,
+                )
+                if bpm_change:
+                    lines.append(bpm_change)
             else:
                 lines.extend([
                     "Suggested #BPM: Withheld",
@@ -2115,6 +2147,13 @@ def format_summary_report(
                     ),
                     f"BPM confidence: {result.bpm_confidence}",
                 ])
+                bpm_change = format_bpm_change(
+                    result.bpm,
+                    result.bpm_correction,
+                    diagnostic_only=True,
+                )
+                if bpm_change:
+                    lines.append(bpm_change)
         if args.write_gap:
             lines.append(f"#GAP write: {result.gap_write_status}")
         if args.write_bpm:
@@ -2224,6 +2263,12 @@ def format_report(
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason}",
             ])
+            bpm_change = format_bpm_change(
+                result.bpm,
+                result.bpm_correction,
+            )
+            if bpm_change:
+                lines.append(bpm_change)
         elif result.suggested_bpm is not None:
             lines.extend([
                 f"Estimated #BPM (diagnostic only): {result.suggested_bpm:.3f}",
@@ -2231,6 +2276,13 @@ def format_report(
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason}",
             ])
+            bpm_change = format_bpm_change(
+                result.bpm,
+                result.bpm_correction,
+                diagnostic_only=True,
+            )
+            if bpm_change:
+                lines.append(bpm_change)
         elif args.bpm != "off":
             lines.extend([
                 "Suggested #BPM: WITHHELD because the evidence is insufficient.",
@@ -2243,6 +2295,13 @@ def format_report(
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason or 'Not assessed'}",
             ])
+            bpm_change = format_bpm_change(
+                result.bpm,
+                result.bpm_correction,
+                diagnostic_only=True,
+            )
+            if bpm_change:
+                lines.append(bpm_change)
 
         if result.transcription:
             lines.extend([

@@ -161,6 +161,11 @@ outcomes clear.
 8. BPM sampling notes and per-sample diagnostics must make skipped windows and
    unreliable samples understandable. A zero residual MAD from only two
    points must not be described as proof of a reliable trend.
+9. When a BPM correction is available, reports include its signed percentage
+   relative to the current BPM: `(suggested BPM - current BPM) / current BPM ×
+   100`. Positive means an increase to the chart tempo; negative means a
+   decrease. This is a chart `#BPM` change, not audio playback-speed
+   modification. Label diagnostic-only percentages as diagnostic-only.
 
 ## 6. Transcription, model lifetime, and recovery
 
@@ -193,7 +198,8 @@ outcomes clear.
    absolute correction is at least 1000 ms, and every chart that triggers the
    opening timing-drift warning, regardless of GAP suggestion eligibility.
 5. Include current and suggested values, confidence, reasons, BPM sample
-   details when enabled, and the result of each requested chart write.
+   details when enabled (including the signed percentage BPM change), and the
+   result of each requested chart write.
    Summary reports must retain write outcomes and key BPM information when
    applicable.
 6. Refuse output paths that would overwrite an existing audio file or
