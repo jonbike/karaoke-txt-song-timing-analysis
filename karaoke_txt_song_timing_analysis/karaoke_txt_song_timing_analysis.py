@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import difflib
 from datetime import datetime, timedelta
-from importlib.metadata import version
 import math
 import multiprocessing
 import os
@@ -40,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import traceback
 
 from dataclasses import dataclass, field
@@ -49,7 +49,9 @@ from typing import Any, Optional
 from korean_romanizer import Romanizer
 
 
-VERSION = version("karaoke-txt-song-timing-analysis")
+PROJECT_FILE = Path(__file__).resolve().parents[1] / "pyproject.toml"
+with PROJECT_FILE.open("rb") as project_file:
+    VERSION = tomllib.load(project_file)["project"]["version"]
 
 
 NOTE_RE = re.compile(

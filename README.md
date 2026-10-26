@@ -99,6 +99,37 @@ triggers the opening timing-drift warning described below. Both reports are
 updated after each song is processed. The command also prints progress and
 both report locations to the terminal.
 
+## Resuming after an interruption
+
+Charts are processed in sorted path order. After each chart finishes, its
+result is appended to both reports and flushed to disk. If a run stops, the
+main report therefore records charts that completed; a chart that was still
+being analyzed when the run stopped may not have an entry. Check its `Chart:`
+paths to identify completed charts, and include the interrupted chart in any
+retry.
+
+There is no automatic resume or skip option. Starting the command again with
+the same `--report` path creates new reports and starts processing from the
+beginning; save the existing main and review reports elsewhere first if you
+need to keep them. To retry only unfinished charts, make a source directory
+containing those charts and their audio, preserving any relative paths used by
+chart audio references, then pass that directory to `--source`. Alternatively,
+rerun the original source if reprocessing completed charts is acceptable.
+
+In a Linux terminal, **Ctrl+Z suspends the process; it does not stop it**. The
+same run can continue from where it paused: use `jobs -l` to find its job
+number, then run `fg %1` (replace `1` with the job number shown). Press Ctrl+C
+only if you intend to stop that resumed run. A suspended process remains alive
+and may continue holding GPU memory and temporary files.
+
+Demucs working files are created in temporary directories named
+`karaoke-demucs-*` under the system temporary directory (commonly `/tmp`).
+Python normally removes them when analysis of a song exits, including when
+Ctrl+C interrupts it. A suspended run keeps its temporary directory; a forced
+kill, crash, or power loss may leave one behind. After confirming no analysis
+process is still running, you can inspect matching directories and remove
+only confirmed leftovers from this tool.
+
 Use `--report-level summary` to write only the key settings and per-chart
 results. The default `--report-level all` keeps the detailed report. When
 `--write-gap` is enabled, either report level includes the result of each
@@ -183,4 +214,6 @@ localized outlier.
 - BPM verification is disabled by default. Enable it with `--bpm on`; it
   samples selected sections rather than transcribing the entire song. Its
   beginning sample reuses the opening GAP matches, while middle/end samples use
-  separately selected lyric sections.
+  separately selected lyric sections. With `--bpm off`, opening matches are
+  still checked for a possible timing-drift warning, but no BPM estimate or
+  suggested `#BPM` is produced.

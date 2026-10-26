@@ -183,8 +183,12 @@ outcomes clear.
 5. If CUDA reports an out-of-memory failure, retry that song once on CPU with
    `int8`. The retry must not change the configured device for subsequent
    songs. Do not retry unrelated failures.
-6. Clean temporary vocal stems and snippets after analysis, including failure
-   paths. Report failures explicitly; `--debug` may add tracebacks.
+6. Clean temporary vocal stems and snippets after analysis, including normal
+   exception and Ctrl+C interruption paths. A suspended process (for example,
+   after Ctrl+Z in a Linux terminal) remains alive and retains its temporary
+   resources until resumed or terminated. Forced termination, a crash, or
+   power loss may prevent cleanup. Report failures explicitly; `--debug` may
+   add tracebacks.
 
 ## 7. Reports and command-line behavior
 
@@ -192,8 +196,11 @@ outcomes clear.
 2. `--report-level all` is the default and includes detailed diagnostics;
    `summary` includes key settings and per-chart results.
 3. Create or overwrite the requested report and a companion review report
-   whose name adds `_review` before the extension. Update both after each
-   chart, so progress is retained if later work fails.
+   whose name adds `_review` before the extension. Process chart paths in
+   sorted order. Update and flush both reports after each completed chart, so
+   completed results are retained if later work fails or the run is
+   interrupted. A chart interrupted before its report entry is written may
+   need to be retried.
 4. The review report includes eligible Medium/High GAP suggestions whose
    absolute correction is at least 1000 ms, and every chart that triggers the
    opening timing-drift warning, regardless of GAP suggestion eligibility.
@@ -209,6 +216,10 @@ outcomes clear.
    opening windows greater than zero, non-negative maximum GAP correction,
    supported report level/device/batch-size choices, and `--write-bpm` only
    with `--bpm on`.
+8. There is no automatic resume or skip option. A new run overwrites its
+   reports and starts from the beginning; users who want to retry only
+   unfinished charts must preserve the old reports and provide a source
+   containing only those charts and their associated audio.
 
 ## 8. Chart-writing safeguards
 
