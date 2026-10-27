@@ -26,8 +26,13 @@ decrease #GAP.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from collections.abc import Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import difflib
 from datetime import datetime, timedelta
+import io
 import math
 import multiprocessing
 import os
@@ -38,6 +43,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import traceback
@@ -64,6 +70,16 @@ ANY_NOTE_RE = re.compile(r"^([^\s:#-])\s+-?\d+\s+\d+\s+-?\d+\s+.*$")
 
 NUMBER_RE = r"[+-]?\d+(?:[.,]\d+)?"
 GAP_RE = re.compile(rf"^\s*#GAP:\s*({NUMBER_RE})", re.I)
+AUDIO_SUFFIXES = {
+    ".mp3",
+    ".m4a",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".aac",
+    ".opus",
+    ".mp4",
+}
 MIN_GAP_WRITE_CHANGE_MS = 100.0
 GAP_BYTES_RE = re.compile(
     rb"^(\xef\xbb\xbf)?([ \t]*#GAP:[ \t]*)"
@@ -172,6 +188,17 @@ class Analysis:
     bpm_write_status: str = ""
 
 
+@dataclass
+class ChartAnalysisOutput:
+    analysis: Analysis
+    logs: str = ""
+
+
+_ACTIVE_CHILD_PROCESSES: set[multiprocessing.Process] = set()
+_ACTIVE_CHILD_PROCESSES_LOCK = threading.Lock()
+_CHART_PROCESS_TERMINATION_REQUESTED = threading.Event()
+
+
 def normalize_word(text: str) -> str:
     """Normalize a word for forgiving text comparisons."""
     return "".join(TOKEN_RE.findall(text.lower()))
@@ -231,6 +258,23 @@ def estimate_completion_time(
     average_duration = statistics.fmean(song_durations[-ETA_SAMPLE_SIZE:])
     return (now or datetime.now()) + timedelta(
         seconds=average_duration * remaining_songs
+    )
+
+
+def estimate_parallel_completion_time(
+    elapsed_seconds: float,
+    completed_songs: int,
+    total_songs: int,
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Estimate completion from the dual-device run's observed throughput."""
+    if completed_songs <= 0 or total_songs < completed_songs:
+        return None
+
+    remaining_songs = total_songs - completed_songs
+    average_seconds_per_completion = elapsed_seconds / completed_songs
+    return (now or datetime.now()) + timedelta(
+        seconds=average_seconds_per_completion * remaining_songs
     )
 
 
@@ -504,15 +548,14 @@ def resolve_case_insensitive(path: Path) -> Optional[Path]:
 
 def find_audio_for_chart(chart_path: Path) -> Optional[Path]:
     """Find audio from #AUDIO or legacy #MP3; otherwise use same-basename lookup."""
-    supported = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".aac", ".opus"}
-    reference_tag, audio_reference = read_audio_reference(chart_path)
+    _reference_tag, audio_reference = read_audio_reference(chart_path)
 
     if audio_reference:
         # Prefer #AUDIO; legacy #MP3 is selected only when #AUDIO is absent.
         reference = Path(audio_reference.replace("\\", "/")).expanduser()
         candidate = reference if reference.is_absolute() else chart_path.parent / reference
         resolved = resolve_case_insensitive(candidate)
-        if resolved and resolved.suffix.casefold() in supported:
+        if resolved and resolved.suffix.casefold() in AUDIO_SUFFIXES:
             return resolved
         return None
 
@@ -520,11 +563,48 @@ def find_audio_for_chart(chart_path: Path) -> Optional[Path]:
         if (
             candidate.is_file()
             and candidate.stem.casefold() == chart_path.stem.casefold()
-            and candidate.suffix.casefold() in supported
+            and candidate.suffix.casefold() in AUDIO_SUFFIXES
         ):
             return candidate
 
     return None
+
+
+def audio_lookup_failure_reason(chart_path: Path) -> str:
+    """Explain whether a referenced or same-basename audio file is missing or unsupported."""
+    reference_tag, audio_reference = read_audio_reference(chart_path)
+    if audio_reference:
+        reference = Path(audio_reference.replace("\\", "/")).expanduser()
+        candidate = reference if reference.is_absolute() else chart_path.parent / reference
+        resolved = resolve_case_insensitive(candidate)
+        if resolved is not None:
+            return (
+                f"Audio file referenced by {reference_tag} ({audio_reference!r}) "
+                f"has unsupported file type {resolved.suffix!r}."
+            )
+        return (
+            f"No audio file referenced by {reference_tag} "
+            f"({audio_reference!r}) was found."
+        )
+
+    try:
+        unsupported_match = next(
+            (
+                candidate
+                for candidate in chart_path.parent.iterdir()
+                if candidate.is_file()
+                and candidate.stem.casefold() == chart_path.stem.casefold()
+            ),
+            None,
+        )
+    except OSError:
+        unsupported_match = None
+    if unsupported_match is not None:
+        return (
+            f"Same-basename audio file {unsupported_match.name!r} has "
+            f"unsupported file type {unsupported_match.suffix!r}."
+        )
+    return "No #AUDIO/#MP3 reference or same-basename audio file was found."
 
 
 def is_existing_ultrastar_chart(path: Path) -> bool:
@@ -1378,16 +1458,7 @@ def _analyze_chart_with_audio(
         return analysis
 
     if audio_path is None:
-        reference_tag, audio_reference = read_audio_reference(chart_path)
-        if audio_reference:
-            analysis.reason = (
-                f"No audio file referenced by {reference_tag} "
-                f"({audio_reference!r}) was found."
-            )
-        else:
-            analysis.reason = (
-                "No #AUDIO/#MP3 reference or same-basename audio file was found."
-            )
+        analysis.reason = audio_lookup_failure_reason(chart_path)
         return analysis
 
     transcription_audio_path = transcription_audio_path or audio_path
@@ -1646,22 +1717,31 @@ def _analyze_chart_with_audio(
     return analysis
 
 
-def _analyze_chart_worker(connection, chart_path: Path, args: argparse.Namespace) -> None:
+def _analyze_chart_worker(
+    connection,
+    chart_path: Path,
+    args: argparse.Namespace,
+    capture_output: bool,
+) -> None:
+    output = io.StringIO()
+    stdout_context = redirect_stdout(output) if capture_output else nullcontext()
+    stderr_context = redirect_stderr(output) if capture_output else nullcontext()
     try:
-        try:
-            result = analyze_chart(chart_path, args)
-        except Exception as exc:
-            result = Analysis(
-                chart_path=chart_path,
-                audio_path=find_audio_for_chart(chart_path),
-                old_gap_ms=None,
-                bpm=None,
-                status="Analysis failed",
-                reason=f"{type(exc).__name__}: {exc}",
-            )
-            if args.debug:
-                result.reason += "\n" + traceback.format_exc()
-        connection.send(result)
+        with stdout_context, stderr_context:
+            try:
+                result = analyze_chart(chart_path, args)
+            except Exception as exc:
+                result = Analysis(
+                    chart_path=chart_path,
+                    audio_path=find_audio_for_chart(chart_path),
+                    old_gap_ms=None,
+                    bpm=None,
+                    status="Analysis failed",
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+                if args.debug:
+                    result.reason += "\n" + traceback.format_exc()
+        connection.send(ChartAnalysisOutput(result, output.getvalue()))
     finally:
         connection.close()
 
@@ -1670,14 +1750,43 @@ def analyze_chart_in_child_process(
     chart_path: Path,
     args: argparse.Namespace,
 ) -> Analysis:
+    return _run_chart_in_child_process(
+        chart_path,
+        args,
+        capture_output=False,
+    ).analysis
+
+
+def analyze_chart_in_child_process_capturing_output(
+    chart_path: Path,
+    args: argparse.Namespace,
+) -> ChartAnalysisOutput:
+    return _run_chart_in_child_process(
+        chart_path,
+        args,
+        capture_output=True,
+    )
+
+
+def _run_chart_in_child_process(
+    chart_path: Path,
+    args: argparse.Namespace,
+    capture_output: bool,
+) -> ChartAnalysisOutput:
     context = multiprocessing.get_context("spawn")
     receive_connection, send_connection = context.Pipe(duplex=False)
     process = context.Process(
         target=_analyze_chart_worker,
-        args=(send_connection, chart_path, args),
+        args=(send_connection, chart_path, args, capture_output),
     )
     try:
-        process.start()
+        with _ACTIVE_CHILD_PROCESSES_LOCK:
+            if _CHART_PROCESS_TERMINATION_REQUESTED.is_set():
+                raise InterruptedError(
+                    "Chart analysis cancelled before its worker process started."
+                )
+            process.start()
+            _ACTIVE_CHILD_PROCESSES.add(process)
     except BaseException:
         receive_connection.close()
         send_connection.close()
@@ -1696,21 +1805,34 @@ def analyze_chart_in_child_process(
         raise
     finally:
         receive_connection.close()
+        with _ACTIVE_CHILD_PROCESSES_LOCK:
+            _ACTIVE_CHILD_PROCESSES.discard(process)
     process.join()
 
     if result is None:
-        return Analysis(
-            chart_path=chart_path,
-            audio_path=find_audio_for_chart(chart_path),
-            old_gap_ms=None,
-            bpm=None,
-            status="Analysis failed",
-            reason=(
-                "Per-chart analysis process exited without returning a result "
-                f"(exit code {process.exitcode})."
-            ),
+        return ChartAnalysisOutput(
+            Analysis(
+                chart_path=chart_path,
+                audio_path=find_audio_for_chart(chart_path),
+                old_gap_ms=None,
+                bpm=None,
+                status="Analysis failed",
+                reason=(
+                    "Per-chart analysis process exited without returning a result "
+                    f"(exit code {process.exitcode})."
+                ),
+            )
         )
     return result
+
+
+def terminate_active_chart_processes() -> None:
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        _CHART_PROCESS_TERMINATION_REQUESTED.set()
+        processes = list(_ACTIVE_CHILD_PROCESSES)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
 
 
 def is_cuda_out_of_memory(reason: str) -> bool:
@@ -1769,6 +1891,131 @@ def analyze_chart_with_cpu_fallback(
             "GPU attempt ran out of memory; analysis succeeded on CPU retry."
         ).strip()
     return cpu_result
+
+
+def _analyze_chart_on_device(
+    chart_path: Path,
+    args: argparse.Namespace,
+    device: str,
+) -> ChartAnalysisOutput:
+    worker_args = argparse.Namespace(**vars(args))
+    worker_args.device = device
+    if not args.compute_type_explicit:
+        worker_args.compute_type = "int8" if device == "cpu" else "float16"
+
+    try:
+        return analyze_chart_in_child_process_capturing_output(
+            chart_path,
+            worker_args,
+        )
+    except Exception as exc:
+        result = Analysis(
+            chart_path=chart_path,
+            audio_path=find_audio_for_chart(chart_path),
+            old_gap_ms=None,
+            bpm=None,
+            status="Analysis failed",
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+        if args.debug:
+            result.reason += "\n" + traceback.format_exc()
+        return ChartAnalysisOutput(result)
+
+
+def analyze_charts_on_both_devices(
+    chart_paths: list[Path],
+    args: argparse.Namespace,
+) -> Iterator[tuple[Path, ChartAnalysisOutput]]:
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        _CHART_PROCESS_TERMINATION_REQUESTED.clear()
+
+    remaining_charts = deque(chart_paths)
+    cpu_retries: deque[tuple[Path, str]] = deque()
+    executors = {
+        "cpu": ThreadPoolExecutor(max_workers=1, thread_name_prefix="chart-cpu"),
+        "cuda": ThreadPoolExecutor(max_workers=1, thread_name_prefix="chart-cuda"),
+    }
+    active_jobs: dict[Future[ChartAnalysisOutput], tuple[Path, str, str]] = {}
+    active_devices: set[str] = set()
+
+    def submit(chart_path: Path, device: str, gpu_error: str = "") -> None:
+        worker_args = argparse.Namespace(**vars(args))
+        if gpu_error:
+            worker_args.compute_type = "int8"
+            worker_args.compute_type_explicit = True
+        future = executors[device].submit(
+            _analyze_chart_on_device,
+            chart_path,
+            worker_args,
+            device,
+        )
+        active_jobs[future] = (chart_path, device, gpu_error)
+        active_devices.add(device)
+        label = "CPU retry" if gpu_error else f"{device.upper()} worker"
+        print(f"[{label}] Analyzing: {chart_path}", flush=True)
+
+    try:
+        while remaining_charts or cpu_retries or active_jobs:
+            if "cuda" not in active_devices and remaining_charts:
+                submit(remaining_charts.popleft(), "cuda")
+
+            if "cpu" not in active_devices:
+                if cpu_retries:
+                    retry_path, gpu_error = cpu_retries.popleft()
+                    submit(retry_path, "cpu", gpu_error)
+                elif remaining_charts:
+                    submit(remaining_charts.popleft(), "cpu")
+
+            if not active_jobs:
+                continue
+
+            completed, _ = wait(active_jobs, return_when=FIRST_COMPLETED)
+            completed_outputs: list[tuple[Path, ChartAnalysisOutput]] = []
+            for future in completed:
+                chart_path, device, gpu_error = active_jobs.pop(future)
+                active_devices.remove(device)
+                output = future.result()
+                if (
+                    device == "cuda"
+                    and not gpu_error
+                    and output.analysis.status == "Analysis failed"
+                    and is_cuda_out_of_memory(output.analysis.reason)
+                ):
+                    if output.logs:
+                        print(output.logs, end="", flush=True)
+                    print(
+                        f"CUDA out of memory; queueing CPU retry: {chart_path.name}",
+                        flush=True,
+                    )
+                    cpu_retries.appendleft((chart_path, output.analysis.reason))
+                else:
+                    if gpu_error:
+                        cpu_result = output.analysis
+                        if cpu_result.status == "Analysis failed":
+                            cpu_result.reason = (
+                                "GPU attempt failed with CUDA out of memory.\n"
+                                f"GPU error: {gpu_error}\n"
+                                "CPU retry also failed.\n"
+                                f"CPU error: {cpu_result.reason}"
+                            )
+                        else:
+                            cpu_result.reason = (
+                                f"{cpu_result.reason}\n"
+                                "GPU attempt ran out of memory; "
+                                "analysis succeeded on CPU retry."
+                            ).strip()
+                    completed_outputs.append((chart_path, output))
+
+            for chart_path, output in completed_outputs:
+                yield chart_path, output
+    except BaseException:
+        for future in active_jobs:
+            future.cancel()
+        terminate_active_chart_processes()
+        raise
+    finally:
+        for executor in executors.values():
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def write_chart_updates(
@@ -2461,6 +2708,72 @@ def format_review_report_entry(result: Analysis) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def resolve_source_directories(source: Path) -> list[Path]:
+    source = source.expanduser().resolve()
+    if source.is_dir():
+        return [source]
+    if not source.is_file():
+        raise ValueError(
+            f"--source must be an existing directory or a text file: {source}"
+        )
+
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read source list {source}: {exc}") from exc
+
+    directories: list[Path] = []
+    for line_number, line in enumerate(lines, start=1):
+        entry = line.strip()
+        if not entry:
+            continue
+
+        entry_path = Path(entry).expanduser()
+        directory = (
+            entry_path if entry_path.is_absolute() else source.parent / entry_path
+        ).resolve()
+        if not directory.is_dir():
+            raise ValueError(
+                f"Source list {source}, line {line_number}: "
+                f"not an existing directory: {entry}"
+            )
+        directories.append(directory)
+
+    if not directories:
+        raise ValueError(f"Source list contains no directory paths: {source}")
+
+    unique_directories = sorted(set(directories), key=lambda directory: directory.parts)
+    non_overlapping_directories: list[Path] = []
+    non_overlapping_set: set[Path] = set()
+    for directory in unique_directories:
+        parent = directory.parent
+        while parent != directory and parent not in non_overlapping_set:
+            if parent == parent.parent:
+                parent = directory
+                break
+            parent = parent.parent
+        if parent == directory:
+            non_overlapping_directories.append(directory)
+            non_overlapping_set.add(directory)
+    return non_overlapping_directories
+
+
+def find_chart_paths(
+    source_directories: list[Path],
+    excluded_paths: set[Path],
+) -> list[Path]:
+    charts_by_resolved_path: dict[Path, Path] = {}
+    for directory in source_directories:
+        for chart_path in directory.rglob("*.txt"):
+            if not chart_path.is_file():
+                continue
+            resolved_chart_path = chart_path.resolve()
+            if resolved_chart_path in excluded_paths:
+                continue
+            charts_by_resolved_path.setdefault(resolved_chart_path, chart_path)
+    return sorted(charts_by_resolved_path.values())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -2472,7 +2785,10 @@ def main() -> int:
     parser.add_argument(
         "--source",
         required=True,
-        help="Directory containing UltraStar .txt charts and matching audio.",
+        help=(
+            "Directory containing charts, or a UTF-8 text file with one song "
+            "directory per line (relative paths are relative to the list file)."
+        ),
     )
     parser.add_argument(
         "--report",
@@ -2498,8 +2814,11 @@ def main() -> int:
     parser.add_argument(
         "--device",
         default="cpu",
-        choices=("cpu", "cuda"),
-        help="Inference device (default: cpu).",
+        choices=("cpu", "cuda", "both"),
+        help=(
+            "Inference device: cpu, cuda, or both (one CPU and one CUDA "
+            "analysis at a time; default: cpu)."
+        ),
     )
     parser.add_argument(
         "--compute-type",
@@ -2588,6 +2907,7 @@ def main() -> int:
     if args.write_bpm and args.bpm != "on":
         parser.error("--write-bpm requires --bpm on.")
 
+    args.compute_type_explicit = args.compute_type is not None
     if args.compute_type is None:
         args.compute_type = "int8" if args.device == "cpu" else "float16"
 
@@ -2597,16 +2917,17 @@ def main() -> int:
         f"{report_path.stem}_review{report_path.suffix}"
     )
 
-    if not source.is_dir():
-        print(f"Error: source directory does not exist: {source}", file=sys.stderr)
+    try:
+        source_directories = resolve_source_directories(source)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 2
 
     # Existing reports may be overwritten, including reports inside the source
     # tree. Still refuse to overwrite an actual chart or audio file.
-    audio_suffixes = {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".aac", ".opus"}
     report_paths = {report_path, review_report_path}
     for output_path in report_paths:
-        if output_path.exists() and output_path.suffix.casefold() in audio_suffixes:
+        if output_path.exists() and output_path.suffix.casefold() in AUDIO_SUFFIXES:
             print(
                 f"Error: report path points to an audio file: {output_path}; "
                 "refusing to overwrite it.",
@@ -2621,13 +2942,20 @@ def main() -> int:
             )
             return 2
 
-    chart_paths = sorted(
-        p for p in source.rglob("*.txt")
-        if p.is_file() and p.resolve() not in report_paths
+    excluded_paths = set(report_paths)
+    if source.is_file():
+        excluded_paths.add(source)
+    chart_paths = find_chart_paths(
+        source_directories,
+        excluded_paths,
     )
 
     if not chart_paths:
-        print(f"No .txt chart files found under: {source}", file=sys.stderr)
+        print(
+            "No .txt chart files found under source path(s): "
+            + ", ".join(str(directory) for directory in source_directories),
+            file=sys.stderr,
+        )
         return 1
 
     try:
@@ -2640,35 +2968,8 @@ def main() -> int:
                     "or a possible opening timing-drift warning\n\n"
                 )
                 song_durations: list[float] = []
-                for index, chart_path in enumerate(chart_paths, start=1):
-                    estimated_end = estimate_completion_time(
-                        song_durations,
-                        len(chart_paths) - index + 1,
-                    )
-                    end_text = (
-                        format_estimated_end(estimated_end)
-                        if estimated_end is not None
-                        else "calculating"
-                    )
-                    print(
-                        f"[{index}/{len(chart_paths)} Estimated End {end_text}] "
-                        f"Analyzing: {chart_path}"
-                    )
-                    song_started_at = time.monotonic()
-                    try:
-                        result = analyze_chart_with_cpu_fallback(chart_path, args)
-                    except Exception as exc:
-                        result = Analysis(
-                            chart_path=chart_path,
-                            audio_path=find_audio_for_chart(chart_path),
-                            old_gap_ms=None,
-                            bpm=None,
-                            status="Analysis failed",
-                            reason=f"{type(exc).__name__}: {exc}",
-                        )
-                        if args.debug:
-                            result.reason += "\n" + traceback.format_exc()
 
+                def append_result(result: Analysis) -> None:
                     if args.write_gap or args.write_bpm:
                         (
                             result.gap_write_status,
@@ -2684,9 +2985,72 @@ def main() -> int:
                     review_report_file.write(format_review_report_entry(result))
                     report_file.flush()
                     review_report_file.flush()
-                    song_durations.append(time.monotonic() - song_started_at)
-                    print(f"    {result.status}: {result.confidence}")
-                    del result
+
+                if args.device == "both":
+                    both_started_at = time.monotonic()
+                    for index, (_, output) in enumerate(
+                        analyze_charts_on_both_devices(chart_paths, args),
+                        start=1,
+                    ):
+                        if output.logs:
+                            print(output.logs, end="", flush=True)
+                            if not output.logs.endswith("\n"):
+                                print(flush=True)
+                        append_result(output.analysis)
+                        estimated_end = estimate_parallel_completion_time(
+                            time.monotonic() - both_started_at,
+                            index,
+                            len(chart_paths),
+                        )
+                        end_text = (
+                            format_estimated_end(estimated_end)
+                            if estimated_end is not None
+                            else "calculating"
+                        )
+                        print(
+                            f"[{index}/{len(chart_paths)} completed; "
+                            f"Estimated End {end_text}] "
+                            f"{output.analysis.chart_path}: "
+                            f"{output.analysis.status}: "
+                            f"{output.analysis.confidence}",
+                            flush=True,
+                        )
+                else:
+                    for index, chart_path in enumerate(chart_paths, start=1):
+                        estimated_end = estimate_completion_time(
+                            song_durations,
+                            len(chart_paths) - index + 1,
+                        )
+                        end_text = (
+                            format_estimated_end(estimated_end)
+                            if estimated_end is not None
+                            else "calculating"
+                        )
+                        print(
+                            f"[{index}/{len(chart_paths)} Estimated End {end_text}] "
+                            f"Analyzing: {chart_path}"
+                        )
+                        song_started_at = time.monotonic()
+                        try:
+                            result = analyze_chart_with_cpu_fallback(
+                                chart_path,
+                                args,
+                            )
+                        except Exception as exc:
+                            result = Analysis(
+                                chart_path=chart_path,
+                                audio_path=find_audio_for_chart(chart_path),
+                                old_gap_ms=None,
+                                bpm=None,
+                                status="Analysis failed",
+                                reason=f"{type(exc).__name__}: {exc}",
+                            )
+                            if args.debug:
+                                result.reason += "\n" + traceback.format_exc()
+                        append_result(result)
+                        song_durations.append(time.monotonic() - song_started_at)
+                        print(f"    {result.status}: {result.confidence}")
+                        del result
     except OSError as exc:
         print(f"Could not write report(s): {exc}", file=sys.stderr)
         return 2

@@ -58,8 +58,13 @@ outcomes clear.
 
 ## 3. Inputs and chart interpretation
 
-1. The required `--source` path must be a directory. Search it recursively for
-   `.txt` charts, excluding report output paths.
+1. The required `--source` path may be a directory or a UTF-8 text file
+   containing one song-directory path per line. Search each directory
+   recursively for `.txt` charts, excluding report output paths. Ignore blank
+   lines; resolve relative list entries from the list file's parent directory.
+   Validate all entries before processing and report an invalid entry with its
+   line number. Reject an empty list. Deduplicate repeated and overlapping
+   directories and chart paths.
 2. A chart should provide valid positive `#BPM`, a `#GAP`, and lyric note lines
    with usable timing. A chart without the required information cannot produce
    a valid timing estimate; report the reason.
@@ -69,7 +74,9 @@ outcomes clear.
    audio file, report that failure rather than silently selecting unrelated
    audio.
 4. Support audio formats accepted by the installed WhisperX stack, including
-   MP3, M4A, WAV, FLAC, OGG, AAC, and Opus.
+   MP3, M4A, WAV, FLAC, OGG, AAC, Opus, and MP4 containers with an audio
+   stream. When a referenced file exists but its extension is unsupported,
+   report that separately from a missing referenced file.
 5. Interpret UltraStar note text as potentially syllabic. Reconstruct lyric
    words using chart word boundaries; a word's chart time is the beat of its
    first fragment converted using `#BPM`. Respect relative timing when
@@ -170,8 +177,11 @@ outcomes clear.
 ## 6. Transcription, model lifetime, and recovery
 
 1. Use the selected WhisperX model (`medium` by default), device (`cpu` by
-   default), compute type (`int8` on CPU and `float16` on CUDA unless
-   overridden), and transcription batch size.
+   default; also accept `both`), compute type (`int8` on CPU and `float16` on
+   CUDA unless overridden), and transcription batch size.
+   In `both` mode, run at most one CPU analysis and one CUDA analysis at once.
+   Use each device's default compute type unless the user explicitly supplies
+   `--compute-type`, in which case use that value on both workers.
 2. `--batch-size` accepts only `4`, `8`, `16`, `32`, or `64`; default to `4`.
    Apply the selected batch size to opening and later-window transcription.
 3. Load the WhisperX transcription model once per song and reuse it for that
@@ -182,7 +192,9 @@ outcomes clear.
    model across songs.
 5. If CUDA reports an out-of-memory failure, retry that song once on CPU with
    `int8`. The retry must not change the configured device for subsequent
-   songs. Do not retry unrelated failures.
+   songs. In `both` mode, queue the retry for the single CPU slot; never start
+   a second CPU analysis while that slot is occupied. Do not retry unrelated
+   failures.
 6. Clean temporary vocal stems and snippets after analysis, including normal
    exception and Ctrl+C interruption paths. A suspended process (for example,
    after Ctrl+Z in a Linux terminal) remains alive and retains its temporary
@@ -196,11 +208,12 @@ outcomes clear.
 2. `--report-level all` is the default and includes detailed diagnostics;
    `summary` includes key settings and per-chart results.
 3. Create or overwrite the requested report and a companion review report
-   whose name adds `_review` before the extension. Process chart paths in
-   sorted order. Update and flush both reports after each completed chart, so
-   completed results are retained if later work fails or the run is
-   interrupted. A chart interrupted before its report entry is written may
-   need to be retried.
+   whose name adds `_review` before the extension. Process discovered chart
+   paths in sorted order for `cpu` and `cuda`; in `both` mode, write results
+   in completion order. In every mode, update and flush both reports after
+   each completed chart, so completed results are retained if later work
+   fails or the run is interrupted. A chart interrupted before its report
+   entry is written may need to be retried.
 4. The review report includes eligible Medium/High GAP suggestions whose
    absolute correction is at least 1000 ms, and every chart that triggers the
    opening timing-drift warning, regardless of GAP suggestion eligibility.
@@ -218,8 +231,21 @@ outcomes clear.
    with `--bpm on`.
 8. There is no automatic resume or skip option. A new run overwrites its
    reports and starts from the beginning; users who want to retry only
-   unfinished charts must preserve the old reports and provide a source
-   containing only those charts and their associated audio.
+   unfinished charts must preserve the old reports and use the retry-list
+   helper to provide a source containing only their directories.
+9. In `both` mode, keep report writing in the parent process and write each
+   complete per-chart entry as its result becomes available. Capture worker
+   logs and display them grouped by song so concurrent output cannot
+   interleave. Show an estimated finish time in progress output based on the
+   elapsed wall time and completed-chart throughput; no estimate is available
+   before the first completion. Progress totals count discovered chart files,
+   not source-list entries or directories.
+10. The retry-list helper compares a prior main report with the original
+    source tree and writes one directory per chart that is missing from the
+    report or whose status is not `Analysis complete`. Deduplicate directories
+    that contain multiple charts and do not overwrite an existing output list
+    unless `--overwrite` is supplied. The generated list must be accepted as
+    `--source`.
 
 ## 8. Chart-writing safeguards
 

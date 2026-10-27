@@ -84,6 +84,53 @@ class SeparateVocalsTests(unittest.TestCase):
                 )
 
 
+class AudioLookupTests(unittest.TestCase):
+    def test_supports_mp4_referenced_by_legacy_mp3_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            song_directory = Path(temporary_directory)
+            chart_path = song_directory / "ABC - Poison Arrow.txt"
+            audio_path = song_directory / "ABC - Poison Arrow.mp4"
+            chart_path.write_text(
+                "#MP3: ABC - Poison Arrow.mp4\n",
+                encoding="utf-8",
+            )
+            audio_path.touch()
+
+            self.assertEqual(analysis.find_audio_for_chart(chart_path), audio_path)
+
+    def test_supports_same_basename_mp4_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            song_directory = Path(temporary_directory)
+            chart_path = song_directory / "song.txt"
+            audio_path = song_directory / "song.mp4"
+            chart_path.write_text("#TITLE:song\n", encoding="utf-8")
+            audio_path.touch()
+
+            self.assertEqual(analysis.find_audio_for_chart(chart_path), audio_path)
+
+    def test_distinguishes_unsupported_reference_from_missing_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            song_directory = Path(temporary_directory)
+            chart_path = song_directory / "song.txt"
+            chart_path.write_text(
+                "#MP3: song.mkv\n",
+                encoding="utf-8",
+            )
+            (song_directory / "song.mkv").touch()
+
+            unsupported_reason = analysis.audio_lookup_failure_reason(chart_path)
+            self.assertIn("unsupported file type '.mkv'", unsupported_reason)
+            self.assertNotIn("was found", unsupported_reason)
+
+            chart_path.write_text(
+                "#MP3: missing.mp4\n",
+                encoding="utf-8",
+            )
+            missing_reason = analysis.audio_lookup_failure_reason(chart_path)
+            self.assertIn("No audio file referenced by #MP3", missing_reason)
+            self.assertIn("was found", missing_reason)
+
+
 class AnalyzeChartWithDemucsTests(unittest.TestCase):
     def test_uses_temporary_vocal_stem_and_cleans_it_after_analysis(self) -> None:
         audio_path = Path("/audio/song.m4a")

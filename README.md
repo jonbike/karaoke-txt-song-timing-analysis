@@ -19,7 +19,7 @@ them.
 - Python 3.13
 - [Poetry](https://python-poetry.org/)
 - Audio files supported by WhisperX, such as MP3, M4A, WAV, FLAC, OGG, AAC,
-  or Opus
+  Opus, or MP4 containers with an audio stream
 
 Poetry installs the project's Python dependencies, including
 `korean-romanizer` for Korean lyric matching and Demucs for music source
@@ -66,10 +66,47 @@ Pass `--source` a directory containing UltraStar `.txt` chart files and their
 audio. The directory is searched recursively. Each chart should include valid
 `#BPM` and `#GAP` values and lyric note lines with usable timings.
 
+To process only selected song directories, `--source` can instead point to a
+UTF-8 text file containing one directory path per line. Blank lines are
+ignored. Paths can be absolute or relative to the list file's directory. Each
+listed directory is searched recursively; overlapping entries are handled
+without processing the same chart more than once. If any listed path does not
+exist or is not a directory, the command stops and identifies its line number.
+For example, `unfinished-folders.txt` could contain:
+
+```text
+/music/Karaoke/Artist A - Song One
+../Karaoke/Artist B - Song Two
+```
+
+Then pass the list file as `--source`:
+
+```sh
+poetry run python karaoke_txt_song_timing_analysis/karaoke_txt_song_timing_analysis.py --source "~/Music/unfinished-folders.txt" --report "~/Music/retry_report.txt" --device both
+```
+
+To generate such a list from a previous run, compare the original source tree
+with its main report. The helper includes charts missing from the report and
+charts whose status is not `Analysis complete` (including worker failures):
+
+```sh
+poetry run python karaoke_txt_song_timing_analysis/generate_retry_list.py \
+  --source "~/Music/Testing" \
+  --report "~/Music/gap_report.txt" \
+  --output "~/Music/unfinished-folders.txt"
+```
+
+The helper reports how many song directories it selected. The output must be
+outside the original source tree, and an existing output file is not replaced
+unless `--overwrite` is supplied. Inspect the generated list, then pass it to
+the analysis program as `--source` to retry those directories.
+
 Audio is found from the chart's `#AUDIO` entry (or legacy `#MP3` entry), or by
 looking for a supported audio file with the same base name in the chart's
 directory. If a chart references an audio file, that reference must resolve to
-a supported audio file.
+a supported audio file. MP4 containers are supported when they contain an
+audio stream. If a referenced file exists but has an unsupported extension, the
+report identifies that file type separately from a missing file.
 
 ## Usage
 
@@ -113,8 +150,10 @@ the same `--report` path creates new reports and starts processing from the
 beginning; save the existing main and review reports elsewhere first if you
 need to keep them. To retry only unfinished charts, make a source directory
 containing those charts and their audio, preserving any relative paths used by
-chart audio references, then pass that directory to `--source`. Alternatively,
-rerun the original source if reprocessing completed charts is acceptable.
+chart audio references, or generate a directory list with the helper described
+in [Preparing your files](#preparing-your-files) and pass that list to
+`--source`. Alternatively, rerun the original source if reprocessing completed
+charts is acceptable.
 
 In a Linux terminal, **Ctrl+Z suspends the process; it does not stop it**. The
 same run can continue from where it paused: use `jobs -l` to find its job
@@ -144,8 +183,8 @@ chart's `#GAP` write attempt.
 | `--report-level` | `all` | Report detail level: `all` for full diagnostics or `summary` for key results. |
 | `--language` | Automatic detection | WhisperX language code, such as `de` for German. |
 | `--model` | `medium` | WhisperX model name. |
-| `--device` | `cpu` | Inference device: `cpu` or `cuda`. |
-| `--compute-type` | Device-dependent | WhisperX compute type; defaults to `int8` on CPU and `float16` on CUDA. |
+| `--device` | `cpu` | Inference device: `cpu`, `cuda`, or `both` (one CPU and one CUDA song at a time). |
+| `--compute-type` | Device-dependent | WhisperX compute type; defaults to `int8` on CPU and `float16` on CUDA. In `both` mode, those defaults apply to their respective workers; an explicit value is used on both. |
 | `--batch-size` | `4` | WhisperX transcription batch size. Choose `4`, `8`, `16`, `32`, or `64`; larger batches use more memory. |
 | `--match-threshold` | `0.55` | Minimum fuzzy word similarity from 0 to 1. Lower values allow less-exact matches. |
 | `--audio-opening-seconds` | `60` | Minimum opening audio window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
@@ -155,6 +194,26 @@ chart's `#GAP` write attempt.
 | `--write-gap` | Off | Update charts when a GAP suggestion is eligible. |
 | `--write-bpm` | Off | Update charts when a BPM suggestion is eligible; requires `--bpm on`. |
 | `--debug` | Off | Include full exception tracebacks in the report. |
+
+### Running on CPU and CUDA together
+
+Use `--device both` to analyze up to two songs at once: one on CPU and one on
+CUDA. This mode is opt-in; `--device cpu` and `--device cuda` continue to
+process one song at a time. In `both` mode, reports are written by the parent
+process as complete song results finish, so entries appear in completion order
+rather than sorted path order. Worker log output is grouped by song and shown
+when that song's analysis finishes. Progress includes an estimated finish time
+based on the average completion rate observed so far; it is approximate and
+should become more useful as more charts complete. Progress counts chart files,
+not source-list lines or song directories. A directory with multiple duet
+charts contributes multiple jobs to the total.
+
+If a CUDA analysis runs out of memory, its song waits for the CPU worker slot
+and is retried there with `int8`. It does not start an additional CPU analysis
+while that slot is occupied. `--device both` may or may not be faster: CPU,
+memory, or disk contention can offset the benefit of overlapping work.
+Benchmark it with representative songs on your machine before relying on a
+speedup.
 
 ## Writing suggested chart values
 
