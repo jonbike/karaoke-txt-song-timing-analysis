@@ -40,8 +40,11 @@ The WhisperX transcription model is loaded once per song and reused for its
 opening and optional later BPM windows.
 With the default `--bpm off`, `ffmpeg` is also used to make a temporary,
 stream-copied clip one second longer than the selected opening window before
-Demucs runs. With `--bpm on`, Demucs receives the full audio so later BPM
-samples remain available. If a song fails with a CUDA out-of-memory error
+Demucs runs. The script probes the first audio stream to choose a matching
+snippet extension; for example, MP2 audio in a file named `.mp3` is written
+into a temporary `.mp2` snippet instead of being incorrectly muxed as MP3.
+With `--bpm on`, Demucs receives the full audio so later BPM samples remain
+available. If a song fails with a CUDA out-of-memory error
 while CUDA is selected, that song is retried once using CPU and `int8`; the
 next song still uses the originally selected device.
 

@@ -1335,8 +1335,31 @@ def create_audio_snippet(
     output_directory: Path,
 ) -> Path:
     """Create a stream-copied audio snippet for opening-window analysis."""
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    codec_name = probe.stdout.strip().casefold()
+    if not codec_name:
+        raise RuntimeError(
+            f"ffprobe did not identify an audio codec in {audio_path}."
+        )
+    snippet_suffix = ".mp2" if codec_name == "mp2" else audio_path.suffix
     snippet_path = output_directory / (
-        f"{audio_path.stem}_{duration_seconds:g}s{audio_path.suffix}"
+        f"{audio_path.stem}_{duration_seconds:g}s{snippet_suffix}"
     )
     subprocess.run(
         [

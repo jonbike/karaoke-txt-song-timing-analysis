@@ -100,8 +100,11 @@ outcomes clear.
 3. Separate vocals with Demucs before WhisperX transcription. Never silently
    fall back to transcribing the original mix after vocal-separation failure.
    With BPM disabled, a temporary stream-copied audio clip one second longer
-   than the selected opening window may be used as Demucs input. With BPM
-   enabled, preserve full audio for later samples.
+   than the selected opening window may be used as Demucs input. Probe its
+   first audio stream and choose `.mp2` for MP2 streams so the temporary file
+   extension matches the copied codec; preserve existing suffix behavior for
+   other codecs. A missing or failed codec probe must be reported rather than
+   guessed. With BPM enabled, preserve full audio for later samples.
 4. Match chart lyrics and aligned audio words in order using fuzzy word
    similarity. The per-match timing offset is:
 

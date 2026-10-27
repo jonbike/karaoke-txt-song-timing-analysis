@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from karaoke_txt_song_timing_analysis import karaoke_txt_song_timing_analysis as analysis
@@ -46,18 +47,22 @@ class SeparateVocalsTests(unittest.TestCase):
         audio_path = Path("/audio/song.mp3")
         with tempfile.TemporaryDirectory() as temp:
             output_directory = Path(temp)
-            command_seen: list[str] = []
+            commands_seen: list[list[str]] = []
 
             def create_snippet(command: list[str], **kwargs: object) -> None:
-                command_seen.extend(command)
+                commands_seen.append(command)
                 self.assertTrue(kwargs["check"])
                 self.assertTrue(kwargs["capture_output"])
-                Path(command[-1]).touch()
+                if command[0] == "ffmpeg":
+                    Path(command[-1]).touch()
 
             with patch.object(
                 analysis.subprocess,
                 "run",
-                side_effect=create_snippet,
+                side_effect=[
+                    SimpleNamespace(stdout="mp3\n"),
+                    create_snippet,
+                ],
             ) as run:
                 snippet_path = analysis.create_audio_snippet(
                     audio_path,
@@ -66,9 +71,51 @@ class SeparateVocalsTests(unittest.TestCase):
                 )
 
         self.assertEqual(snippet_path.name, "song_61s.mp3")
-        self.assertEqual(command_seen[command_seen.index("-t") + 1], "61")
-        self.assertEqual(command_seen[command_seen.index("-map") + 1], "0:a:0")
-        self.assertEqual(command_seen[command_seen.index("-c:a") + 1], "copy")
+        ffprobe_command, ffmpeg_command = run.call_args_list[0].args[0], run.call_args_list[1].args[0]
+        self.assertEqual(ffprobe_command[0], "ffprobe")
+        self.assertEqual(ffmpeg_command[ffmpeg_command.index("-t") + 1], "61")
+        self.assertEqual(ffmpeg_command[ffmpeg_command.index("-map") + 1], "0:a:0")
+        self.assertEqual(ffmpeg_command[ffmpeg_command.index("-c:a") + 1], "copy")
+        self.assertEqual(run.call_count, 2)
+
+    def test_mp2_stream_uses_mp2_snippet_extension(self) -> None:
+        audio_path = Path("/audio/song.mp3")
+        with tempfile.TemporaryDirectory() as temp:
+            output_directory = Path(temp)
+
+            def create_snippet(command: list[str], **kwargs: object) -> None:
+                Path(command[-1]).touch()
+
+            with patch.object(
+                analysis.subprocess,
+                "run",
+                side_effect=[
+                    SimpleNamespace(stdout="mp2\n"),
+                    create_snippet,
+                ],
+            ):
+                snippet_path = analysis.create_audio_snippet(
+                    audio_path,
+                    61,
+                    output_directory,
+                )
+
+        self.assertEqual(snippet_path.name, "song_61s.mp2")
+
+    def test_fails_if_audio_codec_cannot_be_probed(self) -> None:
+        with (
+            patch.object(
+                analysis.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout=" \n"),
+            ) as run,
+            self.assertRaisesRegex(RuntimeError, "did not identify an audio codec"),
+        ):
+            analysis.create_audio_snippet(
+                Path("/audio/song.mp3"),
+                61,
+                Path("/tmp"),
+            )
         run.assert_called_once()
 
     def test_fails_if_demucs_does_not_create_vocals_file(self) -> None:
