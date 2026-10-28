@@ -150,6 +150,71 @@ class BpmEstimationTests(unittest.TestCase):
 
         self.assertEqual(confidence, "High")
 
+    def test_two_strong_samples_outweigh_conflicting_low_match_sample(self) -> None:
+        samples = [
+            analysis.BpmSample(
+                label="Beginning",
+                chart_time_seconds=21.30,
+                offset_ms=12674,
+                match_count=71,
+                spread_ms=44,
+            ),
+            analysis.BpmSample(
+                label="50% (middle)",
+                chart_time_seconds=131.45,
+                offset_ms=12684,
+                match_count=54,
+                spread_ms=23,
+            ),
+            analysis.BpmSample(
+                label="90% (end)",
+                chart_time_seconds=228.16,
+                offset_ms=-7852,
+                match_count=4,
+                spread_ms=75,
+            ),
+        ]
+
+        suggested, correction, confidence, reason = (
+            analysis.estimate_bpm_from_samples(samples, 120.0)
+        )
+
+        self.assertAlmostEqual(suggested, 119.989, places=2)
+        self.assertAlmostEqual(correction, -0.011, places=2)
+        self.assertEqual(confidence, "High")
+        self.assertIn("2 strong samples", reason)
+        self.assertIn("Excluded weaker sample(s)", reason)
+        self.assertIn("90% (end)", reason)
+
+    def test_conflicting_third_strong_sample_prevents_high_confidence(self) -> None:
+        samples = [
+            analysis.BpmSample(
+                label="Beginning",
+                chart_time_seconds=0,
+                offset_ms=0,
+                match_count=45,
+                spread_ms=20,
+            ),
+            analysis.BpmSample(
+                label="Middle",
+                chart_time_seconds=70,
+                offset_ms=10000,
+                match_count=46,
+                spread_ms=20,
+            ),
+            analysis.BpmSample(
+                label="End",
+                chart_time_seconds=140,
+                offset_ms=0,
+                match_count=44,
+                spread_ms=20,
+            ),
+        ]
+
+        _, _, confidence, _ = analysis.estimate_bpm_from_samples(samples, 120.0)
+
+        self.assertEqual(confidence, "Low")
+
     def test_opening_gap_sample_contributes_to_bpm_slope(self) -> None:
         samples = [
             analysis.BpmSample(

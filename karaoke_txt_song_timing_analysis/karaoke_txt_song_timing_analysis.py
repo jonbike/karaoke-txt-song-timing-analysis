@@ -81,6 +81,7 @@ AUDIO_SUFFIXES = {
     ".mp4",
 }
 MIN_GAP_WRITE_CHANGE_MS = 100.0
+MIN_BPM_WRITE_CHANGE_PERCENT = 0.5
 GAP_BYTES_RE = re.compile(
     rb"^(\xef\xbb\xbf)?([ \t]*#GAP:[ \t]*)"
     rb"([+-]?\d+(?:[.,]\d+)?)([ \t]*(?:\r?\n)?)$",
@@ -107,6 +108,10 @@ MIN_GAP_DRIFT_MATCHES = 10
 MIN_GAP_DRIFT_SPAN_SECONDS = 20.0
 MIN_GAP_DRIFT_MS = 1000.0
 MAX_GAP_DRIFT_RESIDUAL_MAD_MS = 1000.0
+GAP_MATCH_CONTEXT_RADIUS_SECONDS = 8.0
+GAP_MATCH_CONTEXT_TOLERANCE_MS = 600.0
+MIN_BPM_STRONG_SAMPLE_MATCHES = 40
+MAX_BPM_STRONG_SAMPLE_SPREAD_MS = 200.0
 
 
 @dataclass
@@ -805,14 +810,24 @@ def estimate_bpm_from_samples(
         sample for sample in samples
         if sample.match_count >= 3 and sample.spread_ms <= 1200
     ]
-    if len(usable) < 2:
+    strong_samples = [
+        sample for sample in usable
+        if (
+            sample.match_count >= MIN_BPM_STRONG_SAMPLE_MATCHES
+            and sample.spread_ms <= MAX_BPM_STRONG_SAMPLE_SPREAD_MS
+        )
+    ]
+    use_strong_samples = len(strong_samples) >= 2
+    estimation_samples = strong_samples if use_strong_samples else usable
+    if len(estimation_samples) < 2:
         return (
             None, None, "Low",
-            f"Only {len(usable)} reliable timing samples; at least 2 are needed.",
+            f"Only {len(estimation_samples)} reliable timing samples; "
+            "at least 2 are needed.",
         )
 
-    span = max(s.chart_time_seconds for s in usable) - min(
-        s.chart_time_seconds for s in usable
+    span = max(s.chart_time_seconds for s in estimation_samples) - min(
+        s.chart_time_seconds for s in estimation_samples
     )
     if span < 30.0:
         return (
@@ -822,8 +837,8 @@ def estimate_bpm_from_samples(
 
     # Theil-Sen slope: median of all pairwise offset slopes, robust to one bad sample.
     slopes = []
-    for i, first in enumerate(usable):
-        for second in usable[i + 1:]:
+    for i, first in enumerate(estimation_samples):
+        for second in estimation_samples[i + 1:]:
             dt = second.chart_time_seconds - first.chart_time_seconds
             if abs(dt) >= 10.0:
                 slopes.append((second.offset_ms - first.offset_ms) / (dt * 1000.0))
@@ -840,17 +855,32 @@ def estimate_bpm_from_samples(
     relative_change = abs(correction) / current_bpm
     intercept = statistics.median(
         sample.offset_ms - slope * sample.chart_time_seconds * 1000.0
-        for sample in usable
+        for sample in estimation_samples
     )
     residuals = [
         sample.offset_ms - (intercept + slope * sample.chart_time_seconds * 1000.0)
-        for sample in usable
+        for sample in estimation_samples
     ]
     residual_mad = median_absolute_deviation(residuals)
+    max_residual = max(abs(residual) for residual in residuals)
+    sample_description = (
+        f"{len(estimation_samples)} strong samples"
+        if use_strong_samples
+        else f"{len(estimation_samples)} reliable samples"
+    )
     sample_summary = (
-        f"{len(usable)} reliable samples over {span:.1f}s; "
+        f"{sample_description} over {span:.1f}s; "
         f"timing-drift residual MAD {residual_mad:.0f} ms."
     )
+    if use_strong_samples:
+        excluded_samples = [
+            sample for sample in usable if sample not in strong_samples
+        ]
+        if excluded_samples:
+            excluded_labels = ", ".join(sample.label for sample in excluded_samples)
+            sample_summary += (
+                f" Excluded weaker sample(s) from the estimate: {excluded_labels}."
+            )
 
     if relative_change > 0.15:
         confidence = "Low"
@@ -858,21 +888,33 @@ def estimate_bpm_from_samples(
             f"Estimated BPM change {relative_change * 100:.1f}% exceeds the "
             f"15% safety limit; review sample matches. {sample_summary}"
         )
-    elif len(usable) == 2:
+    elif use_strong_samples and len(strong_samples) == 2:
+        confidence = "High"
+        reason = (
+            "At least 2 sections each have at least "
+            f"{MIN_BPM_STRONG_SAMPLE_MATCHES} matches, offset MAD no greater "
+            f"than {MAX_BPM_STRONG_SAMPLE_SPREAD_MS:.0f} ms, and span at least "
+            f"30s. {sample_summary}"
+        )
+    elif len(estimation_samples) == 2:
         confidence = "Low"
         reason = (
             f"Only 2 reliable samples over {span:.1f}s; at least 3 are needed "
             f"for a stronger confidence assessment. {sample_summary}"
         )
     elif (
-        len(usable) >= 3
-        and all(sample.match_count >= 4 for sample in usable)
+        len(estimation_samples) >= 3
+        and all(sample.match_count >= 4 for sample in estimation_samples)
         and residual_mad <= 500
-        and all(sample.spread_ms <= 700 for sample in usable)
+        and (not use_strong_samples or max_residual <= 500)
+        and all(sample.spread_ms <= 700 for sample in estimation_samples)
     ):
         confidence = "High"
         reason = sample_summary
-    elif residual_mad <= 1000:
+    elif (
+        residual_mad <= 1000
+        and (not use_strong_samples or max_residual <= 1000)
+    ):
         confidence = "Medium"
         reason = sample_summary
     else:
@@ -1041,6 +1083,126 @@ def median_absolute_deviation(values: list[float]) -> float:
     return statistics.median(abs(x - median) for x in values)
 
 
+def weighted_median(values: list[float], weights: list[float]) -> float:
+    """Return the first value whose cumulative weight reaches half the total."""
+    if len(values) != len(weights) or not values:
+        raise ValueError("values and weights must have the same non-zero length")
+    if any(weight <= 0 or not math.isfinite(weight) for weight in weights):
+        raise ValueError("weights must be finite and positive")
+
+    ordered = sorted(zip(values, weights))
+    half_weight = sum(weights) / 2
+    cumulative_weight = 0.0
+    for index, (value, weight) in enumerate(ordered):
+        cumulative_weight += weight
+        if cumulative_weight > half_weight:
+            return value
+        if (
+            math.isclose(cumulative_weight, half_weight)
+            and index + 1 < len(ordered)
+        ):
+            return (value + ordered[index + 1][0]) / 2
+    raise RuntimeError("Unable to calculate weighted median.")
+
+
+def gap_match_context_weights(matches: list[Match]) -> list[float]:
+    """Weight matches by local timing agreement with their lyric neighbors."""
+    weights = [0.0] * len(matches)
+    ordered_indices = sorted(
+        range(len(matches)),
+        key=lambda index: matches[index].chart.seconds,
+    )
+
+    for ordered_position, match_index in enumerate(ordered_indices):
+        match = matches[match_index]
+        left_neighbor = (
+            matches[ordered_indices[ordered_position - 1]]
+            if ordered_position > 0
+            else None
+        )
+        right_neighbor = (
+            matches[ordered_indices[ordered_position + 1]]
+            if ordered_position + 1 < len(ordered_indices)
+            else None
+        )
+        if (
+            left_neighbor is not None
+            and match.chart.seconds - left_neighbor.chart.seconds
+            > GAP_MATCH_CONTEXT_RADIUS_SECONDS
+        ):
+            left_neighbor = None
+        if (
+            right_neighbor is not None
+            and right_neighbor.chart.seconds - match.chart.seconds
+            > GAP_MATCH_CONTEXT_RADIUS_SECONDS
+        ):
+            right_neighbor = None
+        nearby_neighbors = [
+            neighbor
+            for neighbor in (left_neighbor, right_neighbor)
+            if neighbor is not None
+        ]
+        supporting_left = (
+            left_neighbor is not None
+            and abs(match.gap_ms - left_neighbor.gap_ms)
+            <= GAP_MATCH_CONTEXT_TOLERANCE_MS
+        )
+        supporting_right = (
+            right_neighbor is not None
+            and abs(match.gap_ms - right_neighbor.gap_ms)
+            <= GAP_MATCH_CONTEXT_TOLERANCE_MS
+        )
+
+        if supporting_left and supporting_right:
+            context_weight = 1.0
+        elif supporting_left or supporting_right:
+            context_weight = 0.8
+        elif nearby_neighbors:
+            context_weight = 0.2
+        else:
+            context_weight = 0.35
+
+        similarity_weight = 0.9 + 0.1 * max(
+            0.0,
+            min(1.0, match.similarity),
+        )
+        weights[match_index] = context_weight * similarity_weight
+
+    return weights
+
+
+def count_supported_informative_phrases(
+    matches: list[Match],
+    weights: list[float],
+    minimum_weight: float,
+) -> int:
+    """Count lyric phrase groups with at least two supported informative words."""
+    ordered = sorted(
+        zip(matches, weights),
+        key=lambda item: item[0].chart.seconds,
+    )
+    phrase_counts: list[int] = []
+    previous_match: Optional[Match] = None
+
+    for match, weight in ordered:
+        if (
+            previous_match is None
+            or match.chart.seconds - previous_match.chart.seconds > 0.65
+        ):
+            phrase_counts.append(0)
+        if (
+            weight >= minimum_weight
+            and (
+                len(normalize_word(match.chart.text)) >= 3
+                or len(normalize_word(match.audio.text)) >= 3
+            )
+        ):
+            phrase_counts[-1] += 1
+        previous_match = match
+
+    return sum(count >= 2 for count in phrase_counts)
+
+
 def detect_gap_drift_warning(matches: list[Match]) -> str:
     """Flag a sustained opening offset trend that may confound the GAP estimate."""
     if len(matches) < MIN_GAP_DRIFT_MATCHES:
@@ -1100,36 +1262,55 @@ def evaluate_matches(
     if not matches:
         return None, None, "Low", "No ordered lyric matches were found."
 
-    gap_values = [m.gap_ms for m in matches]
-    suggested_gap = statistics.median(gap_values)
+    match_weights = gap_match_context_weights(matches)
+    gap_values = [match.gap_ms for match in matches]
+    suggested_gap = weighted_median(gap_values, match_weights)
     correction = suggested_gap - old_gap_ms
-    spread = median_absolute_deviation(gap_values)
+    spread = weighted_median(
+        [abs(gap - suggested_gap) for gap in gap_values],
+        match_weights,
+    )
+    supported_matches = [
+        match
+        for match, weight in zip(matches, match_weights)
+        if weight >= 0.7
+    ]
 
     strong_matches = [
-        m for m in matches
+        m for m in supported_matches
         if m.similarity >= max(threshold + 0.12, 0.67)
     ]
 
     distinct_phrases = 0
-    if len(matches) >= 2:
+    ordered_matches = sorted(matches, key=lambda match: match.chart.seconds)
+    if len(ordered_matches) >= 2:
         # A phrase boundary is approximated by a gap in chart timing.
-        for previous, current in zip(matches, matches[1:]):
+        for previous, current in zip(ordered_matches, ordered_matches[1:]):
             if current.chart.seconds - previous.chart.seconds > 0.65:
                 distinct_phrases += 1
 
     matched_span = (
-        matches[-1].audio.start - matches[0].audio.start
+        ordered_matches[-1].audio.start - ordered_matches[0].audio.start
         if len(matches) >= 2
         else 0.0
     )
 
-    # Short common words are useful to anchor the sequence, but don't allow
-    # them alone to justify a GAP change.
     informative_matches = [
-        m for m in matches
-        if len(normalize_word(m.chart.text)) >= 3
-        or len(normalize_word(m.audio.text)) >= 3
+        match
+        for match, weight in zip(matches, match_weights)
+        if (
+            weight >= 0.7
+            and (
+                len(normalize_word(match.chart.text)) >= 3
+                or len(normalize_word(match.audio.text)) >= 3
+            )
+        )
     ]
+    supported_phrases = count_supported_informative_phrases(
+        matches,
+        match_weights,
+        minimum_weight=0.7,
+    )
 
     if len(matches) < 3:
         return (
@@ -1139,13 +1320,13 @@ def evaluate_matches(
             f"Only {len(matches)} ordered matches; at least 3 are needed.",
         )
 
-    if len(informative_matches) < 2:
+    if len(informative_matches) < 2 or supported_phrases < 1:
         return (
             suggested_gap,
             correction,
             "Low",
-            "Too few informative word matches; short common words alone "
-            "are not enough.",
+            "Too few context-supported informative word matches; matches "
+            "must agree with nearby lyric timings.",
         )
 
     if spread > 1500:
@@ -1168,18 +1349,34 @@ def evaluate_matches(
 
     # Lower confidence is expected for fuzzy singing recognition. The
     # threshold is intentionally not a hard veto once sequence/timing agree.
-    if len(matches) >= 5 and spread <= 600 and len(strong_matches) >= 2:
+    if (
+        len(informative_matches) >= 5
+        and supported_phrases >= 2
+        and spread <= 600
+        and len(strong_matches) >= 2
+    ):
         confidence = "High"
-    elif len(matches) >= 3 and spread <= 1000:
+    elif (
+        len(informative_matches) >= 3
+        and supported_phrases >= 2
+        and spread <= 1000
+    ):
         confidence = "Medium"
     else:
         confidence = "Low"
 
     reasons = [
         f"{len(matches)} ordered matches",
-        f"{len(strong_matches)} stronger matches",
-        f"timing MAD {spread:.0f} ms",
+        f"{len(supported_matches)} context-supported matches",
+        f"{len(informative_matches)} context-supported informative matches",
+        f"{len(strong_matches)} stronger supported matches",
+        f"{supported_phrases} supported phrase groups",
+        f"weighted timing MAD {spread:.0f} ms",
     ]
+    if supported_phrases < 2:
+        reasons.append(
+            "matches are concentrated in fewer than 2 supported phrase groups"
+        )
     if distinct_phrases:
         reasons.append(f"{distinct_phrases} possible phrase boundaries")
     if matched_span:
@@ -2171,6 +2368,22 @@ def write_chart_updates(
         elif new_value == current_value:
             bpm_status = f"No update needed: {field_name} is already {new_value_text}."
             continue
+        elif field_name == "#BPM":
+            change_percent = abs(new_value - current_value) / current_value * 100
+            if (
+                change_percent < MIN_BPM_WRITE_CHANGE_PERCENT
+                and not math.isclose(
+                    change_percent,
+                    MIN_BPM_WRITE_CHANGE_PERCENT,
+                    rel_tol=1e-12,
+                )
+            ):
+                bpm_status = (
+                    f"Skipped: proposed #BPM change is {change_percent:.3f}%, "
+                    f"below the {MIN_BPM_WRITE_CHANGE_PERCENT:.2f}% write "
+                    "threshold."
+                )
+                continue
 
         updates.append(
             (field_name, line_index, match.group(2), new_value_text, current_value, new_value)

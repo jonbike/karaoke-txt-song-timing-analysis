@@ -20,14 +20,14 @@ class ChartWriteTests(unittest.TestCase):
                 old_gap_ms=100,
                 bpm=120,
                 status="Analyzed",
-                suggested_bpm=120.1234,
+                suggested_bpm=120.75,
                 bpm_confidence="High",
             )
 
             status = analysis.write_bpm_update(result)
 
-            self.assertIn("Updated #BPM from 120 to 120.123", status)
-            self.assertEqual(chart_path.read_bytes(), b"#TITLE:Song\r\n#GAP: 100\r\n#BPM: 120.123\r\n")
+            self.assertIn("Updated #BPM from 120 to 120.750", status)
+            self.assertEqual(chart_path.read_bytes(), b"#TITLE:Song\r\n#GAP: 100\r\n#BPM: 120.750\r\n")
             self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), original)
 
     def test_combined_updates_share_one_backup_of_original_chart(self) -> None:
@@ -85,7 +85,7 @@ class ChartWriteTests(unittest.TestCase):
             self.assertEqual(chart_path.read_bytes(), original)
             self.assertFalse(chart_path.with_suffix(".bak").exists())
 
-    def test_bpm_write_uses_three_decimal_precision_without_minimum_threshold(self) -> None:
+    def test_bpm_write_skips_change_below_percentage_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             chart_path = Path(temporary_directory) / "song.txt"
             original = b"#TITLE:Song\n#BPM: 120\n"
@@ -96,16 +96,38 @@ class ChartWriteTests(unittest.TestCase):
                 old_gap_ms=None,
                 bpm=120,
                 status="Analyzed",
-                suggested_bpm=120.001,
+                suggested_bpm=120.599,
                 bpm_confidence="Medium",
             )
 
             status = analysis.write_bpm_update(result)
 
-            self.assertIn("Updated #BPM from 120 to 120.001", status)
+            self.assertIn("proposed #BPM change is 0.499%", status)
+            self.assertIn("below the 0.50% write threshold", status)
+            self.assertEqual(chart_path.read_bytes(), original)
+            self.assertFalse(chart_path.with_suffix(".bak").exists())
+
+    def test_bpm_write_accepts_change_at_percentage_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#BPM: 120\n"
+            chart_path.write_bytes(original)
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=None,
+                bpm=120,
+                status="Analyzed",
+                suggested_bpm=120.6,
+                bpm_confidence="Medium",
+            )
+
+            status = analysis.write_bpm_update(result)
+
+            self.assertIn("Updated #BPM from 120 to 120.600", status)
             self.assertEqual(
                 chart_path.read_bytes(),
-                b"#TITLE:Song\n#BPM: 120.001\n",
+                b"#TITLE:Song\n#BPM: 120.600\n",
             )
 
     def test_summary_report_includes_bpm_suggestion_and_write_status(self) -> None:

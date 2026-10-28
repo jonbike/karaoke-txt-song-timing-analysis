@@ -224,10 +224,12 @@ Without `--write-gap` or `--write-bpm`, chart and audio files are read only.
 `--write-gap` updates a chart only when the GAP estimate has Medium or High
 confidence, is finite, and differs from the current value by at least 100 ms.
 `--write-bpm` requires `--bpm on` and updates only finite, positive BPM
-suggestions with Medium or High confidence. BPM values are written to three
-decimal places; there is no additional minimum-change threshold. If both
-options are enabled, eligible values are written together from one chart
-snapshot. Before changing a chart, the tool refreshes a sibling backup named
+suggestions with Medium or High confidence, and only when the proposed change
+is at least 0.5% of the current BPM. The threshold is evaluated after rounding
+the suggestion to the three decimal places written to the chart; smaller
+changes remain visible in the report but are not written. If both options are
+enabled, eligible values are written together from one chart snapshot. Before
+changing a chart, the tool refreshes a sibling backup named
 `<chart-stem>.bak` (for example, `song.bak` for `song.txt`). Audio files are never
 modified. Review the report and keep backups before enabling chart updates.
 
@@ -240,15 +242,26 @@ labeled accordingly.
 
 ## How GAP estimates handle outliers
 
-The GAP estimate is the median of the timing offsets from accepted ordered
-lyric matches. Each accepted match contributes equally: similarity is used to
-decide whether a match meets `--match-threshold`, not to give its timing more
-or less weight. Matches are not discarded just because their offsets are far
-from the median. The median limits the influence of a small minority of
-outliers, while the median absolute deviation (MAD) describes how spread out
-the offsets are and contributes to the confidence rating. A high MAD can
-therefore make a result Low confidence and prevent it from being recommended
-or written, even though the median still provides a diagnostic estimate.
+The GAP estimate is a context-weighted median of timing offsets from accepted
+ordered lyric matches. A match receives more weight when its offset agrees
+with adjacent lyric matches within 8 chart seconds, and less when nearby
+matches disagree or it has no nearby context. Similarity still controls
+whether a match meets `--match-threshold`; it only adjusts the weight slightly
+after acceptance. Matches are not discarded solely because their offsets are
+far from the estimate. The weighted median absolute deviation (MAD) describes
+the spread and contributes to confidence.
+
+Confidence depends on context-supported informative matches and their
+distribution across lyric phrase groups, not only on the raw match count.
+High confidence requires at least five supported informative matches across
+at least two phrase groups, weighted MAD no greater than 600 ms, and at least
+two strong supported matches. Medium confidence requires at least three
+supported informative matches across two phrase groups and weighted MAD no
+greater than 1,000 ms. This avoids treating a cluster of repeated words in one
+short phrase as broad evidence. A high MAD or insufficiently distributed
+support can therefore make a result Low confidence and prevent it from being
+recommended or written, even though the weighted median still provides a
+diagnostic estimate.
 
 The report also warns when at least 10 opening matches spanning at least 20
 chart seconds show a Theil-Sen offset trend of at least 1,000 ms across that

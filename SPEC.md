@@ -110,14 +110,16 @@ outcomes clear.
 
    `audio word start - chart word time`
 
-   The GAP estimate is the median of all accepted ordered-match offsets.
-   Matches contribute equally; similarity determines whether a match meets
-   the threshold, but does not weight its timing offset. Do not discard
-   matches solely because their offsets are far from the median. The median
-   limits the influence of a small minority of outliers, while the median
-   absolute deviation (MAD) reports offset spread and contributes to
-   confidence. Report the number and quality of matches, timing spread,
-   confidence, and reason a result is withheld.
+   The GAP estimate is the context-weighted median of accepted ordered-match
+   offsets. Weight each match using the nearest preceding and following
+   matches within 8 chart seconds: give it full context weight when both
+   neighbors agree within 600 ms, reduced weight when only one agrees, very
+   low weight when nearby matches disagree, and low weight when it has no
+   nearby context. Similarity may adjust the context weight modestly, but
+   accepted matches must not be discarded solely because their offsets
+   disagree. Use weighted MAD for offset spread. Report raw and
+   context-supported match counts, supported phrase groups, weighted timing
+   spread, confidence, and reason a result is withheld.
    Also issue a diagnostic warning when at least 10 opening matches spanning
    at least 20 chart seconds show a Theil-Sen offset trend of at least
    1000 ms across the span, with trend-fit residual MAD no greater than
@@ -130,13 +132,16 @@ outcomes clear.
    from normal GAP recommendations.
 6. GAP confidence rules:
    - Low if there are fewer than three ordered matches, fewer than two
-     informative matches, timing MAD above 1500 ms, or the absolute correction
-     exceeds the configured maximum.
-   - High if there are at least five ordered matches, timing MAD no greater
-     than 600 ms, and at least two strong matches. A strong match has
+     context-supported informative matches, no supported phrase group,
+     weighted timing MAD above 1500 ms, or the absolute correction exceeds
+     the configured maximum.
+   - High if there are at least five context-supported informative matches
+     across at least two supported phrase groups, weighted MAD no greater than
+     600 ms, and at least two strong supported matches. A strong match has
      similarity at least `max(match threshold + 0.12, 0.67)`.
-   - Otherwise Medium if there are at least three ordered matches and timing
-     MAD no greater than 1000 ms; otherwise Low.
+   - Otherwise Medium if there are at least three context-supported
+     informative matches across at least two supported phrase groups and
+     weighted MAD no greater than 1000 ms; otherwise Low.
    Lower-confidence estimates may be shown for diagnosis, but must not be
    presented as writable suggestions.
 
@@ -156,21 +161,30 @@ outcomes clear.
    BPM is inferred from change in offset over chart time.
 5. A sample is currently considered usable for estimation when it has at least
    three matches and offset MAD no greater than 1200 ms. Require at least two
-   usable samples spanning at least 30 seconds. Report the number of reliable
-   samples actually used; a displayed sample that fails the reliability filter
-   does not contribute to the estimate.
-6. A proposed relative BPM change above 15% is Low confidence. Two usable
-   samples cannot receive stronger than Low confidence. High confidence
-   requires at least three usable samples, at least four matches in every
-   sample, residual MAD no greater than 500 ms, and sample offset MAD no
-   greater than 700 ms. Otherwise Medium requires residual MAD no greater than
-   1000 ms; a larger residual MAD is Low confidence.
+   usable samples spanning at least 30 seconds. When at least two usable samples
+   each have at least 40 matches and offset MAD no greater than 200 ms, estimate
+   BPM using only those strong samples; weaker samples must not pull the
+   estimate away from them. Report the samples actually used and identify any
+   weaker samples excluded from the estimate.
+6. A proposed relative BPM change above 15% is Low confidence. Two ordinary
+   usable samples cannot receive stronger than Low confidence. Two strong
+   samples as defined above, spanning at least 30 seconds, can receive High
+   confidence. With three or more samples, High confidence requires at least
+   four matches in every sample, residual MAD no greater than 500 ms, and sample
+   offset MAD no greater than 700 ms. When the estimate uses three or more
+   strong samples, the maximum absolute residual must also be no greater than
+   500 ms so one conflicting strong section cannot be hidden by the median.
+   Otherwise Medium requires residual MAD no greater than 1000 ms; when using
+   strong samples, maximum absolute residual must also be no greater than
+   1000 ms. Larger residuals are Low confidence.
 7. Low or unassessed GAP confidence downgrades any BPM estimate to Low and
    marks it diagnostic-only. Diagnostic BPM values must not be written to the
    chart.
 8. BPM sampling notes and per-sample diagnostics must make skipped windows and
    unreliable samples understandable. A zero residual MAD from only two
-   points must not be described as proof of a reliable trend.
+   ordinary samples must not be described as proof of a reliable trend; the
+   strong-sample match-count and offset-MAD criteria are required for two
+   sections to establish High confidence.
 9. When a BPM correction is available, reports include its signed percentage
    relative to the current BPM: `(suggested BPM - current BPM) / current BPM ×
    100`. Positive means an increase to the chart tempo; negative means a
@@ -258,9 +272,10 @@ outcomes clear.
    confidence whose rounded change is at least 100 ms. Do not update if the
    chart's GAP has changed since analysis.
 3. `--write-bpm` requires `--bpm on`. It may update only a finite positive
-   BPM suggestion with Medium or High BPM confidence. Write three decimal
-   places; there is no separate minimum-change threshold. Do not update if
-   the chart's BPM has changed since analysis.
+   BPM suggestion with Medium or High BPM confidence when its rounded change
+   is at least 0.5% of the current BPM. Round to three decimal places before
+   evaluating the percentage and writing. Do not update if the chart's BPM has
+   changed since analysis.
 4. If both write options are enabled, combine eligible changes into one
    update and one backup of the original chart.
 5. Before replacing a chart, refresh the sibling `<chart-stem>.bak` backup and
