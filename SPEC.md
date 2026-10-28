@@ -274,10 +274,19 @@ outcomes clear.
 3. `--write-bpm` requires `--bpm on`. It may update only a finite positive
    BPM suggestion with Medium or High BPM confidence when its rounded change
    is at least 0.5% of the current BPM. Round to three decimal places before
-   evaluating the percentage and writing. Do not update if the chart's BPM has
-   changed since analysis.
-4. If both write options are enabled, combine eligible changes into one
-   update and one backup of the original chart.
+   evaluating the percentage and writing. `--write-bpm` implies `--write-gap`.
+   If the BPM is updated, write BPM alone first, then reanalyze the chart with
+   the updated BPM. Use the second pass to verify BPM and calculate the GAP;
+   never write the first-pass GAP after changing BPM. Write GAP only from the
+   second pass, preserving the original pre-BPM backup across both writes. Do
+   not automatically write a second BPM suggestion. If reanalysis fails, retain
+   the BPM update and clearly report that GAP was not recalculated or written.
+   If no BPM update occurs, the first-pass GAP may be written normally. Do not
+   update if the chart's BPM has changed since analysis.
+4. If BPM is not updated and both GAP and BPM writes are enabled, combine any
+   eligible first-pass changes into one chart update and one backup. When BPM
+   is updated, follow the two-pass sequence in rule 3 and preserve the original
+   backup for the later GAP write.
 5. Before replacing a chart, refresh the sibling `<chart-stem>.bak` backup and
    verify it matches the bytes read for the update. Refuse to replace chart or
    backup symlinks.

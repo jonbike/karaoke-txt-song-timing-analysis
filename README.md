@@ -194,8 +194,8 @@ chart's `#GAP` write attempt.
 | `--chart-opening-seconds` | `60` | Minimum chart opening window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
 | `--max-correction-ms` | `15000` | Maximum correction allowed for a GAP suggestion. |
 | `--bpm` | `off` | Set to `on` to enable BPM analysis using sampled song sections. |
-| `--write-gap` | Off | Update charts when a GAP suggestion is eligible. |
-| `--write-bpm` | Off | Update charts when a BPM suggestion is eligible; requires `--bpm on`. |
+| `--write-gap` | Off | Update charts when a GAP suggestion is eligible; implied by `--write-bpm`. |
+| `--write-bpm` | Off | Update eligible BPM suggestions; requires `--bpm on`, also enables GAP writing, and reanalyzes after a BPM update. |
 | `--debug` | Off | Include full exception tracebacks in the report. |
 
 ### Running on CPU and CUDA together
@@ -227,9 +227,17 @@ confidence, is finite, and differs from the current value by at least 100 ms.
 suggestions with Medium or High confidence, and only when the proposed change
 is at least 0.5% of the current BPM. The threshold is evaluated after rounding
 the suggestion to the three decimal places written to the chart; smaller
-changes remain visible in the report but are not written. If both options are
-enabled, eligible values are written together from one chart snapshot. Before
-changing a chart, the tool refreshes a sibling backup named
+changes remain visible in the report but are not written. Enabling
+`--write-bpm` also enables GAP writing. If a BPM change is written, the tool
+first updates only `#BPM`, then reanalyzes the chart using that new tempo and
+uses the second pass to verify BPM and calculate the GAP to write. It never
+writes the stale first-pass GAP alongside a BPM change, and does not apply a
+second BPM correction automatically. The original chart backup is retained
+through both writes. If the BPM is not changed, the first-pass GAP can be
+written normally. When only GAP is eligible, it is written from the first pass.
+If the second analysis fails, the BPM update remains, but GAP is not written;
+the report identifies the failed reanalysis.
+Before changing a chart, the tool refreshes a sibling backup named
 `<chart-stem>.bak` (for example, `song.bak` for `song.txt`). Audio files are never
 modified. Review the report and keep backups before enabling chart updates.
 

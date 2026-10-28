@@ -64,6 +64,142 @@ class ChartWriteTests(unittest.TestCase):
             )
             self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), original)
 
+    def test_bpm_write_reanalyzes_before_writing_gap_and_preserves_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#GAP: 100\n#BPM: 120\n"
+            chart_path.write_bytes(original)
+            first_pass = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analysis complete",
+                suggested_bpm=120.6,
+                bpm_confidence="High",
+                suggested_gap_ms=500,
+                correction_ms=400,
+                confidence="High",
+            )
+            second_pass = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120.6,
+                status="Analysis complete",
+                suggested_bpm=120.6,
+                bpm_confidence="High",
+                suggested_gap_ms=250,
+                correction_ms=150,
+                confidence="High",
+            )
+            args = analysis.argparse.Namespace(
+                device="both",
+                debug=False,
+            )
+
+            def reanalyze(
+                path: Path,
+                passed_args: analysis.argparse.Namespace,
+            ) -> analysis.Analysis:
+                self.assertEqual(path, chart_path)
+                self.assertEqual(passed_args.device, "cuda")
+                self.assertEqual(
+                    chart_path.read_bytes(),
+                    b"#TITLE:Song\n#GAP: 100\n#BPM: 120.600\n",
+                )
+                return second_pass
+
+            with patch.object(
+                analysis,
+                "analyze_chart_with_cpu_fallback",
+                side_effect=reanalyze,
+            ):
+                analysis.write_first_pass_chart_updates(
+                    first_pass,
+                    analysis.argparse.Namespace(write_bpm=True, write_gap=True),
+                )
+                result = analysis.reanalyze_after_bpm_update(first_pass, args)
+
+            self.assertEqual(result, second_pass)
+            self.assertIn("Updated #BPM from 120 to 120.600", result.bpm_write_status)
+            self.assertIn("Updated #GAP from 100 ms to 250 ms", result.gap_write_status)
+            self.assertEqual(
+                chart_path.read_bytes(),
+                b"#TITLE:Song\n#GAP: 250\n#BPM: 120.600\n",
+            )
+            self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), original)
+            self.assertTrue(
+                any("Second analysis pass ran" in note for note in result.bpm_sample_notes)
+            )
+
+    def test_failed_bpm_reanalysis_never_writes_first_pass_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#GAP: 100\n#BPM: 120\n"
+            chart_path.write_bytes(original)
+            first_pass = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analysis complete",
+                suggested_bpm=120.6,
+                bpm_confidence="High",
+            )
+            args = analysis.argparse.Namespace(device="cpu", debug=False)
+
+            first_pass.bpm_write_status = analysis.write_bpm_update(first_pass)
+            with patch.object(
+                analysis,
+                "analyze_chart_with_cpu_fallback",
+                return_value=analysis.Analysis(
+                    chart_path=chart_path,
+                    audio_path=None,
+                    old_gap_ms=None,
+                    bpm=None,
+                    status="Analysis failed",
+                    reason="test failure",
+                ),
+            ):
+                result = analysis.reanalyze_after_bpm_update(first_pass, args)
+
+            self.assertIn("second analysis pass failed", result.gap_write_status)
+            self.assertIn("first-pass GAP was not written", result.gap_write_status)
+            self.assertEqual(
+                chart_path.read_bytes(),
+                b"#TITLE:Song\n#GAP: 100\n#BPM: 120.600\n",
+            )
+
+    def test_skipped_bpm_update_writes_gap_from_first_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            chart_path.write_bytes(b"#TITLE:Song\n#GAP: 100\n#BPM: 120\n")
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analysis complete",
+                suggested_bpm=120.3,
+                bpm_confidence="High",
+                suggested_gap_ms=250,
+                confidence="High",
+            )
+
+            bpm_was_updated = analysis.write_first_pass_chart_updates(
+                result,
+                analysis.argparse.Namespace(write_bpm=True, write_gap=True),
+            )
+
+            self.assertFalse(bpm_was_updated)
+            self.assertIn("below the 0.50% write threshold", result.bpm_write_status)
+            self.assertIn("Updated #GAP", result.gap_write_status)
+            self.assertEqual(
+                chart_path.read_bytes(),
+                b"#TITLE:Song\n#GAP: 250\n#BPM: 120\n",
+            )
+
     def test_bpm_write_skips_low_confidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             chart_path = Path(temporary_directory) / "song.txt"
@@ -220,6 +356,62 @@ class ChartWriteTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("--write-bpm requires --bpm on", stderr.getvalue())
+
+    def test_write_bpm_implies_gap_writing_in_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "songs"
+            source.mkdir()
+            chart_path = source / "song.txt"
+            chart_path.write_text(
+                "#TITLE:Song\n#GAP: 100\n#BPM: 120\n",
+                encoding="utf-8",
+            )
+            report_path = root / "report.txt"
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analysis complete",
+                suggested_gap_ms=300,
+                confidence="Low",
+                suggested_bpm=121,
+                bpm_correction=1,
+                bpm_confidence="Low",
+            )
+
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "karaoke_txt_song_timing_analysis.py",
+                        "--source",
+                        str(source),
+                        "--report",
+                        str(report_path),
+                        "--bpm",
+                        "on",
+                        "--write-bpm",
+                    ],
+                ),
+                patch.object(
+                    analysis,
+                    "analyze_chart_with_cpu_fallback",
+                    return_value=result,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(analysis.main(), 0)
+
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Writing #BPM also enables #GAP writing", report)
+            self.assertIn("#GAP write: Skipped: GAP confidence is Low", report)
+            self.assertIn("#BPM write: Skipped: BPM confidence is Low", report)
+            self.assertEqual(
+                chart_path.read_text(encoding="utf-8"),
+                "#TITLE:Song\n#GAP: 100\n#BPM: 120\n",
+            )
 
 
 if __name__ == "__main__":

@@ -2242,6 +2242,7 @@ def write_chart_updates(
     result: Analysis,
     write_gap: bool,
     write_bpm: bool,
+    preserved_backup: Optional[bytes] = None,
 ) -> tuple[str, str]:
     """Back up a chart once and atomically write eligible GAP/BPM suggestions."""
     gap_status = ""
@@ -2422,8 +2423,12 @@ def write_chart_updates(
     update_error: Optional[OSError] = None
     cleanup_error: Optional[OSError] = None
     try:
-        shutil.copy2(chart_path, backup_path)
-        if backup_path.read_bytes() != original:
+        if preserved_backup is None:
+            shutil.copy2(chart_path, backup_path)
+            expected_backup = original
+        else:
+            expected_backup = preserved_backup
+        if backup_path.read_bytes() != expected_backup:
             failure = (
                 "Skipped: chart contents changed while preparing the backup; "
                 f"the refreshed backup is {backup_path}."
@@ -2495,14 +2500,100 @@ def write_chart_updates(
     return gap_status, bpm_status
 
 
-def write_gap_update(result: Analysis) -> str:
+def write_gap_update(
+    result: Analysis,
+    preserved_backup: Optional[bytes] = None,
+) -> str:
     """Back up a chart and write an eligible GAP suggestion."""
-    return write_chart_updates(result, write_gap=True, write_bpm=False)[0]
+    return write_chart_updates(
+        result,
+        write_gap=True,
+        write_bpm=False,
+        preserved_backup=preserved_backup,
+    )[0]
 
 
 def write_bpm_update(result: Analysis) -> str:
     """Back up a chart and write an eligible BPM suggestion."""
     return write_chart_updates(result, write_gap=False, write_bpm=True)[1]
+
+
+def reanalyze_after_bpm_update(
+    first_pass: Analysis,
+    args: argparse.Namespace,
+) -> Analysis:
+    """Recalculate GAP and verify BPM after a successful BPM chart update."""
+    chart_path = first_pass.chart_path
+    backup_path = chart_path.with_suffix(".bak")
+    try:
+        preserved_backup = backup_path.read_bytes()
+    except OSError as exc:
+        preserved_backup = None
+        backup_error = (
+            f"Could not preserve the original chart backup for the GAP update: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    else:
+        backup_error = ""
+
+    reanalysis_args = argparse.Namespace(**vars(args))
+    if reanalysis_args.device == "both":
+        reanalysis_args.device = "cuda"
+
+    try:
+        result = analyze_chart_with_cpu_fallback(chart_path, reanalysis_args)
+    except Exception as exc:
+        result = Analysis(
+            chart_path=chart_path,
+            audio_path=first_pass.audio_path,
+            old_gap_ms=None,
+            bpm=None,
+            status="Analysis failed",
+            reason=(
+                "Reanalysis after the #BPM update failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+        if args.debug:
+            result.reason += "\n" + traceback.format_exc()
+
+    result.bpm_write_status = first_pass.bpm_write_status
+    result.bpm_sample_notes.append(
+        "Second analysis pass ran after the #BPM update to recalculate GAP "
+        "and verify BPM; no second BPM update was attempted."
+    )
+    if result.status == "Analysis failed":
+        result.gap_write_status = (
+            "Skipped: #BPM was updated, but the second analysis pass failed; "
+            "the first-pass GAP was not written."
+        )
+    elif backup_error:
+        result.gap_write_status = (
+            "Skipped: #BPM was updated and GAP was recalculated, but the "
+            f"original backup could not be verified. {backup_error}"
+        )
+    elif preserved_backup is None:
+        result.gap_write_status = (
+            "Skipped: #BPM was updated, but the original chart backup is "
+            "unavailable; GAP was not written."
+        )
+    else:
+        result.gap_write_status = write_gap_update(
+            result,
+            preserved_backup=preserved_backup,
+        )
+    return result
+
+
+def write_first_pass_chart_updates(result: Analysis, args: argparse.Namespace) -> bool:
+    """Write eligible first-pass values and report whether BPM changed."""
+    if args.write_bpm:
+        result.bpm_write_status = write_bpm_update(result)
+        if result.bpm_write_status.startswith("Updated #BPM "):
+            return True
+    if args.write_gap:
+        result.gap_write_status = write_gap_update(result)
+    return False
 
 
 def format_ms(value: Optional[float]) -> str:
@@ -2553,6 +2644,12 @@ def format_summary_report(
             f"WhisperX batch size: {args.batch_size}",
             f"Initial audio opening window: {args.audio_opening_seconds:.1f} seconds",
             f"Initial chart opening window: {args.chart_opening_seconds:.1f} seconds",
+            (
+                "Writing #BPM also enables #GAP writing; a successful BPM "
+                "update triggers a second analysis pass before GAP is written."
+                if args.write_bpm
+                else ""
+            ),
             "",
         ])
 
@@ -2643,6 +2740,9 @@ def format_summary_report(
             lines.append(f"#GAP write: {result.gap_write_status}")
         if args.write_bpm:
             lines.append(f"#BPM write: {result.bpm_write_status}")
+        if result.bpm_sample_notes:
+            lines.extend(["BPM sampling notes:"])
+            lines.extend(f"  - {note}" for note in result.bpm_sample_notes)
         lines.append("")
 
     return "\n".join(lines)
@@ -2679,6 +2779,12 @@ def format_report(
             f"WhisperX batch size: {args.batch_size}",
             f"Initial audio opening window: {args.audio_opening_seconds:.1f} seconds",
             f"Initial chart opening window: {args.chart_opening_seconds:.1f} seconds",
+            (
+                "Writing #BPM also enables #GAP writing; a successful BPM "
+                "update triggers a second analysis pass before GAP is written."
+                if args.write_bpm
+                else ""
+            ),
             "BPM verification can sample later sections without transcribing the full song.",
             "",
         ])
@@ -3112,7 +3218,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Update chart #GAP values when confidence is Medium or High; "
-            "refresh a sibling .bak backup first."
+            "refresh a sibling .bak backup first. Implied by --write-bpm."
         ),
     )
     parser.add_argument(
@@ -3120,7 +3226,8 @@ def main() -> int:
         action="store_true",
         help=(
             "Update chart #BPM values when confidence is Medium or High; "
-            "requires --bpm on and refreshes a sibling .bak backup first."
+            "requires --bpm on, also enables #GAP writing, and reanalyzes "
+            "after a successful BPM update."
         ),
     )
     parser.add_argument(
@@ -3142,6 +3249,8 @@ def main() -> int:
 
     if args.write_bpm and args.bpm != "on":
         parser.error("--write-bpm requires --bpm on.")
+    if args.write_bpm:
+        args.write_gap = True
 
     args.compute_type_explicit = args.compute_type is not None
     if args.compute_type is None:
@@ -3206,15 +3315,6 @@ def main() -> int:
                 song_durations: list[float] = []
 
                 def append_result(result: Analysis) -> None:
-                    if args.write_gap or args.write_bpm:
-                        (
-                            result.gap_write_status,
-                            result.bpm_write_status,
-                        ) = write_chart_updates(
-                            result,
-                            write_gap=args.write_gap,
-                            write_bpm=args.write_bpm,
-                        )
                     report_file.write(
                         format_report([result], args, include_header=False)
                     )
@@ -3224,6 +3324,7 @@ def main() -> int:
 
                 if args.device == "both":
                     both_started_at = time.monotonic()
+                    pending_bpm_reanalysis: list[Analysis] = []
                     for index, (_, output) in enumerate(
                         analyze_charts_on_both_devices(chart_paths, args),
                         start=1,
@@ -3232,7 +3333,10 @@ def main() -> int:
                             print(output.logs, end="", flush=True)
                             if not output.logs.endswith("\n"):
                                 print(flush=True)
-                        append_result(output.analysis)
+                        if write_first_pass_chart_updates(output.analysis, args):
+                            pending_bpm_reanalysis.append(output.analysis)
+                        else:
+                            append_result(output.analysis)
                         estimated_end = estimate_parallel_completion_time(
                             time.monotonic() - both_started_at,
                             index,
@@ -3249,6 +3353,23 @@ def main() -> int:
                             f"{output.analysis.chart_path}: "
                             f"{output.analysis.status}: "
                             f"{output.analysis.confidence}",
+                            flush=True,
+                        )
+                    for reanalysis_index, first_pass in enumerate(
+                        pending_bpm_reanalysis,
+                        start=1,
+                    ):
+                        print(
+                            f"[BPM update reanalysis "
+                            f"{reanalysis_index}/{len(pending_bpm_reanalysis)}] "
+                            f"Analyzing: {first_pass.chart_path}",
+                            flush=True,
+                        )
+                        result = reanalyze_after_bpm_update(first_pass, args)
+                        append_result(result)
+                        print(
+                            f"    Second-pass {result.status}: "
+                            f"{result.confidence}",
                             flush=True,
                         )
                 else:
@@ -3283,6 +3404,8 @@ def main() -> int:
                             )
                             if args.debug:
                                 result.reason += "\n" + traceback.format_exc()
+                        if write_first_pass_chart_updates(result, args):
+                            result = reanalyze_after_bpm_update(result, args)
                         append_result(result)
                         song_durations.append(time.monotonic() - song_started_at)
                         print(f"    {result.status}: {result.confidence}")
