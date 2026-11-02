@@ -128,6 +128,30 @@ chart updates; omit it to produce a report without changing chart files.
 To specify a language instead of using automatic detection, pass a WhisperX
 language code, for example `--language de` for German.
 
+For CUDA inference, run the script from the `karaoke_txt_song_timing_analysis/`
+directory. This example with the `medium` model and a batch size of 32 worked
+well on a reasonably powerful laptop:
+
+```sh
+poetry run python karaoke_txt_song_timing_analysis.py --source "~/Music" --report "~/Music/gap_report_english.txt" --language en --model medium --device cuda --match-threshold 0.55 --batch-size 32
+```
+
+For CPU inference, run the script from the same directory:
+
+```sh
+poetry run python karaoke_txt_song_timing_analysis.py --source "~/Musik/Karaoke/ultrastar-es.org/English/Madonna - Like a Virgin" --report "~/Music/new-gap_report_english.txt" --language en --model medium --device cpu --match-threshold 0.55
+```
+
+Both examples only generate reports; they do not modify chart files. Chart
+updates must be explicitly enabled with a command-line switch: use `--write-gap`
+for GAP updates, or `--write-bpm` with `--bpm on` for BPM updates (which also
+enables GAP writing).
+
+The settings in these examples worked well in practice. Depending on the audio
+and transcription, increasing `--match-threshold` or trying a larger WhisperX
+model may improve results. A higher threshold is stricter and may reject some
+valid matches, while larger models require more compute and memory.
+
 The report is created or overwritten at the path given by `--report`. It
 includes each chart's current and suggested `#GAP`, match confidence, analysis
 details, and any reason a suggestion was withheld or a chart could not be
