@@ -177,9 +177,11 @@ outcomes clear.
    Otherwise Medium requires residual MAD no greater than 1000 ms; when using
    strong samples, maximum absolute residual must also be no greater than
    1000 ms. Larger residuals are Low confidence.
-7. Low or unassessed GAP confidence downgrades any BPM estimate to Low and
-   marks it diagnostic-only. Diagnostic BPM values must not be written to the
-   chart.
+7. Report BPM confidence from the BPM estimator independently of GAP
+   confidence. Low or unassessed GAP confidence still blocks BPM updates and
+   marks an otherwise usable BPM estimate diagnostic-only; report the
+   GAP-based write block separately without changing the BPM confidence.
+   Diagnostic BPM values must not be written to the chart.
 8. BPM sampling notes and per-sample diagnostics must make skipped windows and
    unreliable samples understandable. A zero residual MAD from only two
    ordinary samples must not be described as proof of a reliable trend; the

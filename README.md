@@ -299,4 +299,6 @@ localized outlier.
   beginning sample reuses the opening GAP matches, while middle/end samples use
   separately selected lyric sections. With `--bpm off`, opening matches are
   still checked for a possible timing-drift warning, but no BPM estimate or
-  suggested `#BPM` is produced.
+  suggested `#BPM` is produced. BPM confidence in the report reflects the BPM
+  samples themselves; Low or unassessed GAP confidence is shown separately as
+  a reason the BPM result cannot be applied.

@@ -187,6 +187,7 @@ class Analysis:
     bpm_correction: Optional[float] = None
     bpm_confidence: str = "Not assessed"
     bpm_reason: str = ""
+    bpm_write_block_reason: str = ""
     bpm_sample_notes: list[str] = field(default_factory=list)
     bpm_sample_diagnostics: list[BpmSampleDiagnostic] = field(default_factory=list)
     gap_write_status: str = ""
@@ -1929,7 +1930,9 @@ def _analyze_chart_with_audio(
             confidence in {"Low", "Not assessed"}
             and analysis.suggested_bpm is not None
         ):
-            analysis.bpm_confidence = "Low"
+            analysis.bpm_write_block_reason = (
+                f"GAP confidence is {confidence}"
+            )
             analysis.bpm_reason += (
                 f" GAP confidence is {confidence}; BPM result is diagnostic only."
             )
@@ -2259,7 +2262,12 @@ def write_chart_updates(
             gap_status = "Skipped: no finite current #GAP value is available."
 
     if write_bpm:
-        if result.bpm_confidence not in {"High", "Medium"}:
+        if result.bpm_write_block_reason:
+            bpm_status = (
+                f"Skipped: {result.bpm_write_block_reason}; "
+                "BPM result is diagnostic only."
+            )
+        elif result.bpm_confidence not in {"High", "Medium"}:
             bpm_status = (
                 f"Skipped: BPM confidence is {result.bpm_confidence}; "
                 "only Medium or High confidence is writable."
@@ -2706,6 +2714,7 @@ def format_summary_report(
                 result.suggested_bpm is not None
                 and result.bpm_correction is not None
                 and result.bpm_confidence in {"High", "Medium"}
+                and not result.bpm_write_block_reason
             ):
                 lines.extend([
                     f"Suggested #BPM: {result.suggested_bpm:.3f}",
@@ -2729,6 +2738,11 @@ def format_summary_report(
                     ),
                     f"BPM confidence: {result.bpm_confidence}",
                 ])
+                if result.bpm_write_block_reason:
+                    lines.append(
+                        "BPM update: Withheld because "
+                        f"{result.bpm_write_block_reason}."
+                    )
                 bpm_change = format_bpm_change(
                     result.bpm,
                     result.bpm_correction,
@@ -2847,6 +2861,7 @@ def format_report(
         elif (
             result.suggested_bpm is not None
             and result.bpm_confidence in {"High", "Medium"}
+            and not result.bpm_write_block_reason
         ):
             lines.extend([
                 f"Suggested #BPM: {result.suggested_bpm:.3f}",
@@ -2867,6 +2882,11 @@ def format_report(
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason}",
             ])
+            if result.bpm_write_block_reason:
+                lines.append(
+                    "BPM update: Withheld because "
+                    f"{result.bpm_write_block_reason}."
+                )
             bpm_change = format_bpm_change(
                 result.bpm,
                 result.bpm_correction,

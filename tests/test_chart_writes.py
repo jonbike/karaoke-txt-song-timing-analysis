@@ -323,6 +323,27 @@ class ChartWriteTests(unittest.TestCase):
             diagnostic_report,
         )
 
+        gap_blocked_result = analysis.Analysis(
+            chart_path=result.chart_path,
+            audio_path=result.audio_path,
+            old_gap_ms=result.old_gap_ms,
+            bpm=312,
+            status="Analyzed",
+            suggested_bpm=333.152,
+            bpm_correction=21.152,
+            bpm_confidence="High",
+            bpm_write_block_reason="GAP confidence is Low",
+        )
+        gap_blocked_report = analysis.format_summary_report(
+            [gap_blocked_result],
+            args,
+        )
+        self.assertIn("BPM confidence: High", gap_blocked_report)
+        self.assertIn(
+            "BPM update: Withheld because GAP confidence is Low.",
+            gap_blocked_report,
+        )
+
     def test_bpm_change_format_uses_signed_percent_and_chart_direction(self) -> None:
         self.assertEqual(
             analysis.format_bpm_change(100, 20),
@@ -378,7 +399,9 @@ class ChartWriteTests(unittest.TestCase):
                 confidence="Low",
                 suggested_bpm=121,
                 bpm_correction=1,
-                bpm_confidence="Low",
+                bpm_confidence="High",
+                bpm_reason="Strong, consistent BPM samples.",
+                bpm_write_block_reason="GAP confidence is Low",
             )
 
             with (
@@ -407,7 +430,17 @@ class ChartWriteTests(unittest.TestCase):
             report = report_path.read_text(encoding="utf-8")
             self.assertIn("Writing #BPM also enables #GAP writing", report)
             self.assertIn("#GAP write: Skipped: GAP confidence is Low", report)
-            self.assertIn("#BPM write: Skipped: BPM confidence is Low", report)
+            self.assertIn("Estimated #BPM (diagnostic only): 121.000", report)
+            self.assertIn("BPM confidence: High", report)
+            self.assertIn(
+                "BPM update: Withheld because GAP confidence is Low.",
+                report,
+            )
+            self.assertIn(
+                "#BPM write: Skipped: GAP confidence is Low; "
+                "BPM result is diagnostic only.",
+                report,
+            )
             self.assertEqual(
                 chart_path.read_text(encoding="utf-8"),
                 "#TITLE:Song\n#GAP: 100\n#BPM: 120\n",

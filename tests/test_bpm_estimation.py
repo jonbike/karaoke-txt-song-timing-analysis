@@ -7,7 +7,9 @@ from karaoke_txt_song_timing_analysis import karaoke_txt_song_timing_analysis as
 
 
 class BpmEstimationTests(unittest.TestCase):
-    def test_beginning_bpm_sample_reuses_all_opening_gap_matches(self) -> None:
+    def test_beginning_sample_reuse_preserves_bpm_confidence_when_gap_is_low(
+        self,
+    ) -> None:
         chart_words = [
             analysis.ChartWord(text=f"word{index}", beat=0, seconds=40 + index, index=index)
             for index in range(3)
@@ -52,6 +54,11 @@ class BpmEstimationTests(unittest.TestCase):
                 patch.object(analysis, "find_audio_for_chart", return_value=chart_path),
                 patch.object(
                     analysis,
+                    "evaluate_matches",
+                    return_value=(None, None, "Low", "Insufficient GAP evidence."),
+                ),
+                patch.object(
+                    analysis,
                     "transcribe_audio_windows",
                     return_value=(
                         audio_words,
@@ -66,6 +73,11 @@ class BpmEstimationTests(unittest.TestCase):
                 patch.object(analysis, "prepare_audio_words_for_matching", return_value=[]),
                 patch.object(analysis, "local_alignment", return_value=matches),
                 patch.object(analysis, "select_bpm_sample_windows", return_value=([], [])),
+                patch.object(
+                    analysis,
+                    "estimate_bpm_from_samples",
+                    return_value=(121.0, 1.0, "High", "Strong BPM evidence."),
+                ),
             ):
                 result = analysis._analyze_chart_with_audio(
                     chart_path,
@@ -78,6 +90,13 @@ class BpmEstimationTests(unittest.TestCase):
         self.assertEqual(result.bpm_samples[0].match_count, 3)
         self.assertEqual(result.bpm_samples[0].chart_time_seconds, 41)
         self.assertEqual(result.bpm_sample_diagnostics[0].matches, matches)
+        self.assertEqual(result.confidence, "Low")
+        self.assertEqual(result.bpm_confidence, "High")
+        self.assertEqual(
+            result.bpm_write_block_reason,
+            "GAP confidence is Low",
+        )
+        self.assertIn("BPM result is diagnostic only", result.bpm_reason)
 
     def test_transcription_passes_configured_batch_size_to_whisperx(self) -> None:
         whisperx = MagicMock()
