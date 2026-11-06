@@ -24,7 +24,8 @@ them.
 
 - Python 3.12 or 3.13 (Python 3.14 is not supported by the current
   WhisperX dependency)
-- [Poetry](https://python-poetry.org/)
+- [Poetry](https://python-poetry.org/) 2.5.1 or later (needed to resolve the
+  project dependencies for Python 3.12 and 3.13)
 - Project Python packages, including WhisperX, Demucs, and `korean-romanizer`;
   install them with `poetry install` as described in [Installation](#installation).
 - An FFmpeg distribution providing the `ffmpeg` and `ffprobe` command-line
