@@ -1,13 +1,19 @@
 # Karaoke TXT Song Timing Analysis
 
 Analyze UltraStar Deluxe karaoke charts against their audio to estimate
-whether the chart's `#GAP` value should be adjusted and optionally verify its
-`#BPM`. The tool uses WhisperX transcription and word timestamps to compare
-chart lyrics with the recorded vocals, then writes its findings to a text
-report. GAP analysis uses the opening lyrics; optional BPM analysis samples
-selected sections of the song and is disabled by default. Demucs separates the
-vocals before transcription so both GAP and optional BPM analysis use the
-isolated vocal stem.
+whether the chart's `#GAP` value should be adjusted and, optionally, verify
+whether its `#BPM` should be corrected. The tool uses WhisperX transcription
+and word timestamps to compare chart lyrics with the recorded vocals, then
+writes its findings to a text report. GAP analysis uses the opening lyrics;
+optional BPM analysis samples selected sections of the song and is disabled by
+default. Demucs separates the vocals before transcription so both GAP and
+optional BPM analysis use the isolated vocal stem.
+
+## License
+
+Copyright (C) 2026 Jonathan Moore. This project is licensed under the GNU
+General Public License, version 3 only. See [LICENSE](LICENSE) for the full
+license text.
 
 By default, analysis does not change chart or audio files. Optional `#GAP` and
 `#BPM` updates are available with `--write-gap` and `--write-bpm`; see
@@ -29,15 +35,15 @@ been tested, so Windows support is intended but unverified. Demucs 4.1.0's
 PyTorch dependency constraints allow it on Linux and Windows; macOS is not
 supported by this dependency setup.
 
-The selected WhisperX model may need to be downloaded the first time it is
-used. CPU inference is supported; CUDA can be selected on a machine with a
-compatible CUDA/PyTorch setup. Demucs runs on the same device selected for
-analysis (`cpu` by default, or `cuda` when requested). It writes its
-`vocals.wav` stem to an isolated temporary directory; that directory is
-removed after the song has been analyzed. Demucs failures are reported and do
-not silently fall back to transcribing the original mix.
-The WhisperX transcription model is loaded once per song and reused for its
-opening and optional later BPM windows.
+The selected WhisperX model is downloaded the first time it is used and then
+reused from the local cache for subsequent songs. CPU inference is supported;
+CUDA can be selected on a machine with a compatible CUDA/PyTorch setup. Demucs
+runs on the same device selected for analysis (`cpu` by default, or `cuda` when
+requested). It writes its `vocals.wav` stem to an isolated temporary
+directory; that directory is removed after the song has been analyzed. Demucs
+failures are reported and do not silently fall back to transcribing the
+original mix. The WhisperX transcription model is loaded once per song and
+reused for its opening and optional later BPM windows.
 With the default `--bpm off`, `ffmpeg` is also used to make a temporary,
 stream-copied clip one second longer than the selected opening window before
 Demucs runs. The script probes the first audio stream to choose a matching
@@ -68,6 +74,11 @@ poetry install
 Pass `--source` a directory containing UltraStar `.txt` chart files and their
 audio. The directory is searched recursively. Each chart should include valid
 `#BPM` and `#GAP` values and lyric note lines with usable timings.
+
+Songs are typically organized in their own directories, each containing the
+UltraStar text chart, song audio track, video, and any cover art or other
+images. For analysis, the chart and its matching audio are required; video and
+images are not used.
 
 To process only selected song directories, `--source` can instead point to a
 UTF-8 text file containing one directory path per line. Blank lines are
@@ -163,6 +174,45 @@ triggers the opening timing-drift warning described below. Both reports are
 updated after each song is processed. The command also prints progress and
 both report locations to the terminal.
 
+## Typical workflow and review tips
+
+How much to review manually depends on the size of your collection and the
+time you have:
+
+The medium-size WhisperX model has given good results in practice, though
+transcription quality can vary with the audio and lyrics.
+
+If you are starting with a new collection or tuning your settings, first run a
+small batch without `--write-gap` or `--write-bpm`. Review the main and
+companion reports and listen to a few results before deciding whether to
+enable chart updates for a larger run.
+
+- **A handful of songs:** Review each result and play back the songs to check
+  that the suggested timing works in practice. A report is an estimate, so
+  listening is the best way to catch a chart that still feels out of sync.
+- **Hundreds of songs:** Use the companion `_review` report to prioritize
+  eligible Medium/High-confidence GAP suggestions with corrections of at least
+  1,000 ms, along with songs flagged for possible timing drift. It does not
+  include every Medium/Low-confidence result; use the main report to find and
+  review those as well. Check larger corrections and uncertain results before
+  deciding whether to write them.
+- **Thousands of songs:** You may decide to accept High-confidence GAP
+  suggestions with less manual checking, then focus your time on Medium/Low
+  confidence, large corrections, and timing-drift warnings. The right balance
+  depends on how many songs need review and how much time you can spend.
+
+BPM analysis is optional (`--bpm on`) and samples selected parts of each song.
+Check BPM suggestions and their separate BPM confidence in the main report;
+the companion `_review` report is focused on GAP corrections and timing-drift
+warnings. A BPM estimate can have high BPM confidence but still be
+diagnostic-only when GAP confidence is too low. Even a confident BPM suggestion
+is worth checking by listening. If you enable `--write-bpm`, the tool updates
+an eligible BPM and runs one more analysis to recalculate GAP and verify BPM;
+it does not apply another BPM correction in that same run. Review the result
+and run the tool again if another adjustment seems warranted. Songs that speed
+up or slow down may not have one constant BPM, so any single suggested tempo
+is a compromise.
+
 ## Resuming after an interruption
 
 Charts are processed in sorted path order. After each chart finishes, its
@@ -240,7 +290,8 @@ and is retried there with `int8`. It does not start an additional CPU analysis
 while that slot is occupied. `--device both` may or may not be faster: CPU,
 memory, or disk contention can offset the benefit of overlapping work.
 Benchmark it with representative songs on your machine before relying on a
-speedup.
+speedup. Use `--device both` with caution: whether it is suitable depends on
+your hardware resources, including CPU, GPU, and memory capacity.
 
 ## Writing suggested chart values
 
@@ -326,3 +377,20 @@ localized outlier.
   suggested `#BPM` is produced. BPM confidence in the report reflects the BPM
   samples themselves; Low or unassessed GAP confidence is shown separately as
   a reason the BPM result cannot be applied.
+
+## Running the tests
+
+After installing the project dependencies, run the test suite from the
+repository root with:
+
+```sh
+poetry run python -m unittest discover -s tests
+```
+
+This discovers and runs the test modules in `tests/` using Python's built-in
+`unittest` framework.
+
+## Acknowledgments
+
+This project was developed by Jonathan Moore, with assistance from
+AI-powered development tools, including GitHub Copilot.
