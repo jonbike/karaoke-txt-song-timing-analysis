@@ -167,12 +167,17 @@ class ReviewReportTests(unittest.TestCase):
 
             review_path = root / "gap_report_english_review.txt"
             review = review_path.read_text(encoding="utf-8")
+            report_text = report_path.read_text(encoding="utf-8")
             self.assertIn("Audio: /audio/song_0.mp3", review)
             self.assertIn("GAP Correction: +1200 ms", review)
             self.assertIn("Confidence: High", review)
             self.assertNotIn("song_1.mp3", review)
             self.assertIn("Audio: /audio/song_2.mp3", review)
             self.assertIn("sustained -2,750 ms trend", review)
+            self.assertIn(
+                "BPM verification: Disabled (pass --bpm to enable).",
+                report_text,
+            )
             self.assertTrue(report_path.exists())
 
 

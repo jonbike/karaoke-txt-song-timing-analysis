@@ -37,7 +37,7 @@ class BpmEstimationTests(unittest.TestCase):
             batch_size=4,
             match_threshold=0.55,
             max_correction_ms=15000,
-            bpm="on",
+            bpm=True,
             debug=False,
         )
 

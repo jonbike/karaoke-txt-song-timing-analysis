@@ -186,7 +186,7 @@ class AnalyzeChartWithDemucsTests(unittest.TestCase):
         args = Namespace(
             device="cpu",
             debug=False,
-            bpm="on",
+            bpm=True,
             audio_opening_seconds=60,
             chart_opening_seconds=60,
         )
@@ -250,7 +250,7 @@ class AnalyzeChartWithDemucsTests(unittest.TestCase):
         args = Namespace(
             device="cuda",
             debug=False,
-            bpm="on",
+            bpm=True,
             audio_opening_seconds=60,
             chart_opening_seconds=60,
         )
@@ -295,7 +295,7 @@ class AnalyzeChartWithDemucsTests(unittest.TestCase):
         args = Namespace(
             device="cpu",
             debug=False,
-            bpm="off",
+            bpm=False,
             audio_opening_seconds=60,
             chart_opening_seconds=60,
         )
@@ -367,7 +367,7 @@ class AnalyzeChartWithDemucsTests(unittest.TestCase):
             batch_size=4,
             model="medium",
             language="en",
-            bpm="off",
+            bpm=False,
             debug=False,
             match_threshold=0.55,
             max_correction_ms=15000,
@@ -400,7 +400,7 @@ class AnalyzeChartWithDemucsTests(unittest.TestCase):
         args = Namespace(
             device="cpu",
             debug=False,
-            bpm="on",
+            bpm=True,
             audio_opening_seconds=60,
             chart_opening_seconds=60,
         )

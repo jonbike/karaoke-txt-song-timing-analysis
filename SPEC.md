@@ -32,7 +32,7 @@ outcomes clear.
 
 ### Runtime environment
 
-- The project targets Python 3.13 and is installed with Poetry.
+- The project supports Python 3.12 and 3.13 and is installed with Poetry.
 - WhisperX is configured for Linux and Windows; Windows behavior is intended
   but not yet verified. The current dependency setup does not support macOS.
 - CPU is supported. CUDA requires a compatible CUDA/PyTorch environment.
@@ -147,7 +147,7 @@ outcomes clear.
 
 ## 5. BPM verification
 
-1. BPM verification is disabled by default. `--bpm on` enables it.
+1. BPM verification is disabled by default. The `--bpm` flag enables it.
 2. Use no more than three BPM samples:
    - **Beginning:** reuse the opening GAP matches; do not transcribe that
      opening again solely for BPM.
@@ -247,7 +247,7 @@ outcomes clear.
 7. Validate CLI constraints before processing: match threshold in `[0, 1]`,
    opening windows greater than zero, non-negative maximum GAP correction,
    supported report level/device/batch-size choices, and `--write-bpm` only
-   with `--bpm on`.
+   with `--bpm`.
 8. There is no automatic resume or skip option. A new run overwrites its
    reports and starts from the beginning; users who want to retry only
    unfinished charts must preserve the old reports and use the retry-list
@@ -273,7 +273,7 @@ outcomes clear.
 2. `--write-gap` may update only a finite suggestion with Medium or High GAP
    confidence whose rounded change is at least 100 ms. Do not update if the
    chart's GAP has changed since analysis.
-3. `--write-bpm` requires `--bpm on`. It may update only a finite positive
+3. `--write-bpm` requires `--bpm`. It may update only a finite positive
    BPM suggestion with Medium or High BPM confidence when its rounded change
    is at least 0.5% of the current BPM. Round to three decimal places before
    evaluating the percentage and writing. `--write-bpm` implies `--write-gap`.

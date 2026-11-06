@@ -104,7 +104,7 @@ class GapDriftWarningTests(unittest.TestCase):
             batch_size=4,
             audio_opening_seconds=60.0,
             chart_opening_seconds=60.0,
-            bpm="off",
+            bpm=False,
             write_gap=False,
             write_bpm=False,
         )

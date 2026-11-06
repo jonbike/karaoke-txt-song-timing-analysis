@@ -22,8 +22,15 @@ them.
 
 ## Requirements
 
-- Python 3.13
+- Python 3.12 or 3.13 (Python 3.14 is not supported by the current
+  WhisperX dependency)
 - [Poetry](https://python-poetry.org/)
+- Project Python packages, including WhisperX, Demucs, and `korean-romanizer`;
+  install them with `poetry install` as described in [Installation](#installation).
+- An FFmpeg distribution providing the `ffmpeg` and `ffprobe` command-line
+  tools on your `PATH`. These are used when BPM analysis is disabled (the
+  default) to inspect the audio codec and create a temporary opening clip
+  before vocal separation.
 - Audio files supported by WhisperX, such as MP3, M4A, WAV, FLAC, OGG, AAC,
   Opus, or MP4 containers with an audio stream
 
@@ -44,15 +51,18 @@ directory; that directory is removed after the song has been analyzed. Demucs
 failures are reported and do not silently fall back to transcribing the
 original mix. The WhisperX transcription model is loaded once per song and
 reused for its opening and optional later BPM windows.
-With the default `--bpm off`, `ffmpeg` is also used to make a temporary,
-stream-copied clip one second longer than the selected opening window before
-Demucs runs. The script probes the first audio stream to choose a matching
-snippet extension; for example, MP2 audio in a file named `.mp3` is written
-into a temporary `.mp2` snippet instead of being incorrectly muxed as MP3.
-With `--bpm on`, Demucs receives the full audio so later BPM samples remain
-available. If a song fails with a CUDA out-of-memory error
-while CUDA is selected, that song is retried once using CPU and `int8`; the
-next song still uses the originally selected device.
+When BPM analysis is disabled (the default), `ffmpeg` is used to make a
+temporary, stream-copied clip one second longer than the selected opening
+window before Demucs runs. The script probes the first audio stream to choose a
+matching snippet extension; for example, MP2 audio in a file named `.mp3` is
+written into a temporary `.mp2` snippet instead of being incorrectly muxed as
+MP3. When BPM analysis is enabled with `--bpm`, Demucs receives the full audio
+so later BPM samples remain available. If a song fails with a CUDA
+out-of-memory error while CUDA is selected, that song is retried once using
+CPU and `int8`; the next song still uses the originally selected device.
+
+GStreamer is not used directly by this project and does not need to be
+installed for it.
 
 When WhisperX detects Korean and chart lyrics contain no Hangul, aligned
 Whisper words are romanized using Revised Romanization for lyric matching.
@@ -77,8 +87,9 @@ audio. The directory is searched recursively. Each chart should include valid
 
 Songs are typically organized in their own directories, each containing the
 UltraStar text chart, song audio track, video, and any cover art or other
-images. For analysis, the chart and its matching audio are required; video and
-images are not used.
+images. For analysis, the chart and its matching audio are required. A video
+file can be used when the chart's audio reference points to a video container
+that includes an audio stream; cover art and other images are not used.
 
 To process only selected song directories, `--source` can instead point to a
 UTF-8 text file containing one directory path per line. Blank lines are
@@ -96,12 +107,14 @@ For example, `unfinished-folders.txt` could contain:
 Then pass the list file as `--source`:
 
 ```sh
-poetry run python karaoke_txt_song_timing_analysis/karaoke_txt_song_timing_analysis.py --source "~/Music/unfinished-folders.txt" --report "~/Music/retry_report.txt" --device both
+poetry run python karaoke_txt_song_timing_analysis/karaoke_txt_song_timing_analysis.py --source "~/Music/unfinished-folders.txt" --report "~/Music/retry_report.txt" --language en --device cpu --model small --match-threshold 0.55
 ```
 
-To generate such a list from a previous run, compare the original source tree
-with its main report. The helper includes charts missing from the report and
-charts whose status is not `Analysis complete` (including worker failures):
+The `generate_retry_list.py` helper is mainly useful when a previous run was
+stopped or ended unexpectedly and some songs remain to be processed. It
+compares the original source tree with the main report and includes charts
+missing from the report and charts whose status is not `Analysis complete`
+(including worker failures):
 
 ```sh
 poetry run python karaoke_txt_song_timing_analysis/generate_retry_list.py \
@@ -155,7 +168,7 @@ poetry run python karaoke_txt_song_timing_analysis.py --source "~/Musik/Karaoke/
 
 Both examples only generate reports; they do not modify chart files. Chart
 updates must be explicitly enabled with a command-line switch: use `--write-gap`
-for GAP updates, or `--write-bpm` with `--bpm on` for BPM updates (which also
+for GAP updates, or `--write-bpm` with `--bpm` for BPM updates (which also
 enables GAP writing).
 
 The settings in these examples worked well in practice. Depending on the audio
@@ -201,7 +214,7 @@ enable chart updates for a larger run.
   confidence, large corrections, and timing-drift warnings. The right balance
   depends on how many songs need review and how much time you can spend.
 
-BPM analysis is optional (`--bpm on`) and samples selected parts of each song.
+BPM analysis is optional (`--bpm`) and samples selected parts of each song.
 Check BPM suggestions and their separate BPM confidence in the main report;
 the companion `_review` report is focused on GAP corrections and timing-drift
 warnings. A BPM estimate can have high BPM confidence but still be
@@ -267,9 +280,9 @@ chart's `#GAP` write attempt.
 | `--audio-opening-seconds` | `60` | Minimum opening audio window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
 | `--chart-opening-seconds` | `60` | Minimum chart opening window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
 | `--max-correction-ms` | `15000` | Maximum correction allowed for a GAP suggestion. |
-| `--bpm` | `off` | Set to `on` to enable BPM analysis using sampled song sections. |
+| `--bpm` | Off | Enable BPM analysis using sampled song sections. |
 | `--write-gap` | Off | Update charts when a GAP suggestion is eligible; implied by `--write-bpm`. |
-| `--write-bpm` | Off | Update eligible BPM suggestions; requires `--bpm on`, also enables GAP writing, and reanalyzes after a BPM update. |
+| `--write-bpm` | Off | Update eligible BPM suggestions; requires `--bpm`, also enables GAP writing, and reanalyzes after a BPM update. |
 | `--debug` | Off | Include full exception tracebacks in the report. |
 
 ### Running on CPU and CUDA together
@@ -298,7 +311,7 @@ your hardware resources, including CPU, GPU, and memory capacity.
 Without `--write-gap` or `--write-bpm`, chart and audio files are read only.
 `--write-gap` updates a chart only when the GAP estimate has Medium or High
 confidence, is finite, and differs from the current value by at least 100 ms.
-`--write-bpm` requires `--bpm on` and updates only finite, positive BPM
+`--write-bpm` requires `--bpm` and updates only finite, positive BPM
 suggestions with Medium or High confidence, and only when the proposed change
 is at least 0.5% of the current BPM. The threshold is evaluated after rounding
 the suggestion to the three decimal places written to the chart; smaller
@@ -365,14 +378,14 @@ localized outlier.
   audio window, both windows extend to 90 seconds. Explicitly configured
   windows longer than 90 seconds are preserved. When BPM verification is off,
   Demucs is run on a temporary audio clip one second longer than the selected
-  audio window; with `--bpm on`, it uses the full audio to allow later samples.
+  audio window; with `--bpm`, it uses the full audio to allow later samples.
   It does not transcribe the entire song for the GAP estimate.
 - Charts without a valid BPM, GAP, lyric timings, or matching audio cannot
   produce a GAP suggestion. The report records the reason.
-- BPM verification is disabled by default. Enable it with `--bpm on`; it
+- BPM verification is disabled by default. Enable it with `--bpm`; it
   samples selected sections rather than transcribing the entire song. Its
   beginning sample reuses the opening GAP matches, while middle/end samples use
-  separately selected lyric sections. With `--bpm off`, opening matches are
+  separately selected lyric sections. Without `--bpm`, opening matches are
   still checked for a possible timing-drift warning, but no BPM estimate or
   suggested `#BPM` is produced. BPM confidence in the report reflects the BPM
   samples themselves; Low or unassessed GAP confidence is shown separately as

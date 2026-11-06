@@ -1605,7 +1605,7 @@ def analyze_chart(
     with tempfile.TemporaryDirectory(prefix="karaoke-demucs-") as temporary:
         try:
             demucs_input_path = audio_path
-            if args.bpm == "off":
+            if not args.bpm:
                 demucs_input_path = create_audio_snippet(
                     audio_path,
                     audio_opening_seconds + 1.0,
@@ -1784,8 +1784,8 @@ def _analyze_chart_with_audio(
             f"(language: {detected_language}). {reason}"
         )
 
-    if args.bpm == "off":
-        analysis.bpm_reason = "BPM analysis disabled by --bpm off."
+    if not args.bpm:
+        analysis.bpm_reason = "BPM analysis disabled; pass --bpm to enable."
         return analysis
 
     gap_for_sampling = suggested if suggested is not None else gap_ms
@@ -2709,7 +2709,7 @@ def format_summary_report(
         ])
         if result.gap_drift_warning:
             lines.append(f"Warning: {result.gap_drift_warning}")
-        if args.bpm == "on":
+        if args.bpm:
             if (
                 result.suggested_bpm is not None
                 and result.bpm_correction is not None
@@ -2856,8 +2856,8 @@ def format_report(
         if args.write_bpm:
             lines.append(f"#BPM write: {result.bpm_write_status}")
 
-        if args.bpm == "off":
-            lines.extend(["BPM verification: Disabled by --bpm off."])
+        if not args.bpm:
+            lines.extend(["BPM verification: Disabled (pass --bpm to enable)."])
         elif (
             result.suggested_bpm is not None
             and result.bpm_confidence in {"High", "Medium"}
@@ -2894,7 +2894,7 @@ def format_report(
             )
             if bpm_change:
                 lines.append(bpm_change)
-        elif args.bpm != "off":
+        elif args.bpm:
             lines.extend([
                 "Suggested #BPM: WITHHELD because the evidence is insufficient.",
                 (
@@ -2950,8 +2950,8 @@ def format_report(
                     f"{match.gap_ms:8.0f} ms"
                 )
 
-        if args.bpm == "off":
-            lines.extend(["", "BPM verification: Disabled by --bpm off."])
+        if not args.bpm:
+            lines.extend(["", "BPM verification: Disabled (pass --bpm to enable)."])
         else:
             lines.extend(["", "BPM verification:"])
             if result.bpm_samples:
@@ -3229,9 +3229,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--bpm",
-        choices=("on", "off"),
-        default="off",
-        help="Enable or disable BPM analysis (default: off).",
+        action="store_true",
+        help="Enable BPM analysis (disabled by default).",
     )
     parser.add_argument(
         "--write-gap",
@@ -3246,7 +3245,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Update chart #BPM values when confidence is Medium or High; "
-            "requires --bpm on, also enables #GAP writing, and reanalyzes "
+            "requires --bpm, also enables #GAP writing, and reanalyzes "
             "after a successful BPM update."
         ),
     )
@@ -3267,8 +3266,8 @@ def main() -> int:
     if args.max_correction_ms < 0:
         parser.error("--max-correction-ms cannot be negative.")
 
-    if args.write_bpm and args.bpm != "on":
-        parser.error("--write-bpm requires --bpm on.")
+    if args.write_bpm and not args.bpm:
+        parser.error("--write-bpm requires --bpm.")
     if args.write_bpm:
         args.write_gap = True
 

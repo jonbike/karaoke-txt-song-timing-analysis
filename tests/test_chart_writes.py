@@ -287,7 +287,7 @@ class ChartWriteTests(unittest.TestCase):
             batch_size=4,
             audio_opening_seconds=60,
             chart_opening_seconds=60,
-            bpm="on",
+            bpm=True,
             write_gap=False,
             write_bpm=True,
         )
@@ -376,7 +376,7 @@ class ChartWriteTests(unittest.TestCase):
             analysis.main()
 
         self.assertEqual(raised.exception.code, 2)
-        self.assertIn("--write-bpm requires --bpm on", stderr.getvalue())
+        self.assertIn("--write-bpm requires --bpm", stderr.getvalue())
 
     def test_write_bpm_implies_gap_writing_in_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -414,7 +414,6 @@ class ChartWriteTests(unittest.TestCase):
                         "--report",
                         str(report_path),
                         "--bpm",
-                        "on",
                         "--write-bpm",
                     ],
                 ),
