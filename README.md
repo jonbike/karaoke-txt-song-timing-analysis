@@ -188,6 +188,11 @@ triggers the opening timing-drift warning described below. Both reports are
 updated after each song is processed. The command also prints progress and
 both report locations to the terminal.
 
+The main report header records the full command line used to run the analysis.
+When `--allow-small-updates` is set, the report notes that the standard size
+thresholds are bypassed; any GAP or BPM write that relies on this option also
+states that explicitly in its write status.
+
 ## Typical workflow and review tips
 
 How much to review manually depends on the size of your collection and the
@@ -215,10 +220,11 @@ enable chart updates for a larger run.
   confidence, large corrections, and timing-drift warnings. The right balance
   depends on how many songs need review and how much time you can spend.
 
-When writing updates, the tool skips GAP changes smaller than 100 ms and BPM
-changes smaller than 0.5%. These thresholds help with large catalogues by
-avoiding chart edits for small adjustments, making it easier to see which song
-files were meaningfully changed.
+By default, the tool skips GAP changes smaller than 100 ms and BPM changes
+smaller than 0.5%. These thresholds help with large catalogues by avoiding
+chart edits for small adjustments, making it easier to see which song files
+were meaningfully changed. To write smaller changes, add
+`--allow-small-updates` alongside `--write-gap` and/or `--write-bpm`.
 
 BPM analysis is optional (`--bpm`) and samples selected parts of each song.
 Check BPM suggestions and their separate BPM confidence in the main report;
@@ -321,16 +327,19 @@ confidence, is finite, and differs from the current value by at least 100 ms.
 suggestions with Medium or High confidence, and only when the proposed change
 is at least 0.5% of the current BPM. The threshold is evaluated after rounding
 the suggestion to the three decimal places written to the chart; smaller
-changes remain visible in the report but are not written. Enabling
-`--write-bpm` also enables GAP writing. If a BPM change is written, the tool
-first updates only `#BPM`, then reanalyzes the chart using that new tempo and
-uses the second pass to verify BPM and calculate the GAP to write. It never
-writes the stale first-pass GAP alongside a BPM change, and does not apply a
-second BPM correction automatically. The original chart backup is retained
-through both writes. If the BPM is not changed, the first-pass GAP can be
-written normally. When only GAP is eligible, it is written from the first pass.
-If the second analysis fails, the BPM update remains, but GAP is not written;
-the report identifies the failed reanalysis.
+changes remain visible in the report but are not written. Add
+`--allow-small-updates` to bypass only these GAP and BPM size thresholds. The
+option does not enable writing by itself: `--write-gap` and/or `--write-bpm`
+are still required. Confidence, finite-value, stale-chart, and all other write
+safeguards remain in effect. Enabling `--write-bpm` also enables GAP writing.
+If a BPM change is written, the tool first updates only `#BPM`, then reanalyzes
+the chart using that new tempo and uses the second pass to verify BPM and
+calculate the GAP to write. It never writes the stale first-pass GAP alongside
+a BPM change, and does not apply a second BPM correction automatically. The
+original chart backup is retained through both writes. If the BPM is not
+changed, the first-pass GAP can be written normally. When only GAP is eligible,
+it is written from the first pass. If the second analysis fails, the BPM update
+remains, but GAP is not written; the report identifies the failed reanalysis.
 Before changing a chart, the tool refreshes a sibling backup named
 `<chart-stem>.bak` (for example, `song.bak` for `song.txt`). If that backup
 already exists, it is moved into a `backups/` subdirectory before the latest
@@ -382,6 +391,13 @@ localized outlier.
 
 ## Limitations
 
+- The tool is not perfect and cannot reliably detect a suitable GAP or BPM
+  for every song. Synthesized vocals, unusual vocal sounds, local dialects,
+  pronunciation differences, or lyrics that differ from the chart can make
+  transcription and lyric matching difficult. Confidence scores help describe
+  the available evidence, but do not guarantee that a suggestion is correct.
+  Whenever possible, listen to the song and verify suggested GAP and BPM
+  values before relying on or writing them.
 - GAP analysis starts with the opening audio and chart windows, mapping chart
   word times into audio time using the current `#GAP`. If fewer than three
   informative chart words (at least three characters each) fall in both

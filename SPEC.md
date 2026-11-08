@@ -239,6 +239,11 @@ outcomes clear.
 5. Include current and suggested values, confidence, reasons, BPM sample
    details when enabled (including the signed percentage BPM change), and the
    result of each requested chart write.
+   The main report header must include the complete effective command line.
+   When `--allow-small-updates` is supplied, state that the normal GAP/BPM size
+   thresholds are bypassed while other safeguards remain active. If a
+   successful write is below one of those thresholds, its write status must
+   identify the threshold bypassed and that the option enabled the write.
    Summary reports must retain write outcomes and key BPM information when
    applicable.
 6. Refuse output paths that would overwrite an existing audio file or
@@ -271,12 +276,16 @@ outcomes clear.
 1. Without `--write-gap` or `--write-bpm`, chart and audio files remain
    unchanged.
 2. `--write-gap` may update only a finite suggestion with Medium or High GAP
-   confidence whose rounded change is at least 100 ms. Do not update if the
-   chart's GAP has changed since analysis.
+   confidence whose rounded change is at least 100 ms, unless
+   `--allow-small-updates` is supplied. Do not update if the chart's GAP has
+   changed since analysis.
 3. `--write-bpm` requires `--bpm`. It may update only a finite positive
    BPM suggestion with Medium or High BPM confidence when its rounded change
-   is at least 0.5% of the current BPM. Round to three decimal places before
-   evaluating the percentage and writing. `--write-bpm` implies `--write-gap`.
+   is at least 0.5% of the current BPM, unless `--allow-small-updates` is
+   supplied. Round to three decimal places before evaluating the percentage
+   and writing. This option bypasses only the GAP and BPM size thresholds; it
+   does not bypass confidence, value, stale-chart, or other write safeguards,
+   and does not enable writing by itself. `--write-bpm` implies `--write-gap`.
    If the BPM is updated, write BPM alone first, then reanalyze the chart with
    the updated BPM. Use the second pass to verify BPM and calculate the GAP;
    never write the first-pass GAP after changing BPM. Write GAP only from the

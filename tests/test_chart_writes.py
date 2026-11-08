@@ -403,6 +403,103 @@ class ChartWriteTests(unittest.TestCase):
             self.assertEqual(chart_path.read_bytes(), original)
             self.assertFalse(chart_path.with_suffix(".bak").exists())
 
+    def test_allow_small_updates_writes_gap_below_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#GAP: 100\n"
+            chart_path.write_bytes(original)
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analyzed",
+                suggested_gap_ms=150,
+                confidence="High",
+            )
+
+            status = analysis.write_gap_update(result, allow_small_updates=True)
+
+            self.assertIn("Updated #GAP from 100 ms to 150 ms", status)
+            self.assertIn(
+                "below the normal 100 ms threshold; written because "
+                "--allow-small-updates was supplied",
+                status,
+            )
+            self.assertEqual(chart_path.read_bytes(), b"#TITLE:Song\n#GAP: 150\n")
+            self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), original)
+
+    def test_allow_small_updates_does_not_bypass_gap_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#GAP: 100\n"
+            chart_path.write_bytes(original)
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analyzed",
+                suggested_gap_ms=150,
+                confidence="Low",
+            )
+
+            status = analysis.write_gap_update(result, allow_small_updates=True)
+
+            self.assertIn("only Medium or High confidence is writable", status)
+            self.assertEqual(chart_path.read_bytes(), original)
+            self.assertFalse(chart_path.with_suffix(".bak").exists())
+
+    def test_allow_small_updates_writes_bpm_below_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#BPM: 120\n"
+            chart_path.write_bytes(original)
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=None,
+                bpm=120,
+                status="Analyzed",
+                suggested_bpm=120.3,
+                bpm_confidence="High",
+            )
+
+            status = analysis.write_bpm_update(result, allow_small_updates=True)
+
+            self.assertIn("Updated #BPM from 120 to 120.300", status)
+            self.assertIn(
+                "below the normal 0.50% threshold; written because "
+                "--allow-small-updates was supplied",
+                status,
+            )
+            self.assertEqual(
+                chart_path.read_bytes(),
+                b"#TITLE:Song\n#BPM: 120.300\n",
+            )
+            self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), original)
+
+    def test_allow_small_updates_does_not_bypass_bpm_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#BPM: 120\n"
+            chart_path.write_bytes(original)
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=None,
+                bpm=120,
+                status="Analyzed",
+                suggested_bpm=120.3,
+                bpm_confidence="Low",
+            )
+
+            status = analysis.write_bpm_update(result, allow_small_updates=True)
+
+            self.assertIn("only Medium or High confidence is writable", status)
+            self.assertEqual(chart_path.read_bytes(), original)
+            self.assertFalse(chart_path.with_suffix(".bak").exists())
+
     def test_bpm_write_accepts_change_at_percentage_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             chart_path = Path(temporary_directory) / "song.txt"
@@ -537,6 +634,70 @@ class ChartWriteTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("--write-bpm requires --bpm", stderr.getvalue())
+
+    def test_allow_small_updates_flag_reaches_chart_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "songs"
+            source.mkdir()
+            chart_path = source / "song.txt"
+            original = "#TITLE:Song\n#GAP: 100\n"
+            chart_path.write_text(original, encoding="utf-8")
+            report_path = root / "report.txt"
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analysis complete",
+                suggested_gap_ms=150,
+                confidence="High",
+            )
+
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "karaoke_txt_song_timing_analysis.py",
+                        "--source",
+                        str(source),
+                        "--report",
+                        str(report_path),
+                        "--write-gap",
+                        "--allow-small-updates",
+                    ],
+                ),
+                patch.object(
+                    analysis,
+                    "analyze_chart_with_cpu_fallback",
+                    return_value=result,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(analysis.main(), 0)
+
+            self.assertEqual(
+                chart_path.read_text(encoding="utf-8"),
+                "#TITLE:Song\n#GAP: 150\n",
+            )
+            self.assertEqual(
+                chart_path.with_suffix(".bak").read_text(encoding="utf-8"),
+                original,
+            )
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Command line: ", report)
+            self.assertIn("--source " + str(source), report)
+            self.assertIn("--write-gap --allow-small-updates", report)
+            self.assertIn(
+                "--allow-small-updates was supplied: the normal GAP and BPM "
+                "size thresholds are bypassed",
+                report,
+            )
+            self.assertIn(
+                "below the normal 100 ms threshold; written because "
+                "--allow-small-updates was supplied",
+                report,
+            )
 
     def test_write_bpm_implies_gap_writing_in_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

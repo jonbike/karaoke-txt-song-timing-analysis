@@ -37,6 +37,7 @@ import math
 import multiprocessing
 import os
 import re
+import shlex
 import shutil
 import stat
 import statistics
@@ -2305,6 +2306,7 @@ def write_chart_updates(
     write_gap: bool,
     write_bpm: bool,
     preserved_backup: Optional[bytes] = None,
+    allow_small_updates: bool = False,
 ) -> tuple[str, str]:
     """Back up a chart once and atomically write eligible GAP/BPM suggestions."""
     gap_status = ""
@@ -2365,6 +2367,7 @@ def write_chart_updates(
 
     lines = original.splitlines(keepends=True)
     updates: list[tuple[str, int, bytes, str, float, float]] = []
+    small_update_notes: dict[str, str] = {}
     requested_fields = []
     if write_gap and not gap_status:
         requested_fields.append(
@@ -2427,18 +2430,23 @@ def write_chart_updates(
             if change == 0:
                 gap_status = f"No update needed: {field_name} is already {new_value_text}."
                 continue
-            if change < MIN_GAP_WRITE_CHANGE_MS:
+            if not allow_small_updates and change < MIN_GAP_WRITE_CHANGE_MS:
                 gap_status = (
                     f"Skipped: proposed #GAP change is {change:.1f} ms, below "
                     f"the {MIN_GAP_WRITE_CHANGE_MS:.0f} ms write threshold."
                 )
                 continue
+            if allow_small_updates and change < MIN_GAP_WRITE_CHANGE_MS:
+                small_update_notes[field_name] = (
+                    "below the normal 100 ms threshold; written because "
+                    "--allow-small-updates was supplied"
+                )
         elif new_value == current_value:
             bpm_status = f"No update needed: {field_name} is already {new_value_text}."
             continue
         elif field_name == "#BPM":
             change_percent = abs(new_value - current_value) / current_value * 100
-            if (
+            if not allow_small_updates and (
                 change_percent < MIN_BPM_WRITE_CHANGE_PERCENT
                 and not math.isclose(
                     change_percent,
@@ -2452,6 +2460,19 @@ def write_chart_updates(
                     "threshold."
                 )
                 continue
+            if (
+                allow_small_updates
+                and change_percent < MIN_BPM_WRITE_CHANGE_PERCENT
+                and not math.isclose(
+                    change_percent,
+                    MIN_BPM_WRITE_CHANGE_PERCENT,
+                    rel_tol=1e-12,
+                )
+            ):
+                small_update_notes[field_name] = (
+                    "below the normal 0.50% threshold; written because "
+                    "--allow-small-updates was supplied"
+                )
 
         updates.append(
             (field_name, line_index, match.group(2), new_value_text, current_value, new_value)
@@ -2567,15 +2588,21 @@ def write_chart_updates(
                 bpm_status = failure
     else:
         for field_name, _, _, new_value_text, current_value, _ in updates:
+            small_update_note = small_update_notes.get(field_name)
+            if small_update_note:
+                small_update_note = f"; {small_update_note}"
+            else:
+                small_update_note = ""
             if field_name == "#GAP":
                 status = (
                     f"Updated #GAP from {format_ms(current_value)} to "
-                    f"{format_ms(float(new_value_text))}; "
+                    f"{format_ms(float(new_value_text))}{small_update_note}; "
                     f"{backup_details(backup_path, archived_backup_path)}."
                 )
             else:
                 status = (
-                    f"Updated #BPM from {current_value:g} to {new_value_text}; "
+                    f"Updated #BPM from {current_value:g} to "
+                    f"{new_value_text}{small_update_note}; "
                     f"{backup_details(backup_path, archived_backup_path)}."
                 )
             if field_name == "#GAP":
@@ -2599,6 +2626,7 @@ def write_chart_updates(
 def write_gap_update(
     result: Analysis,
     preserved_backup: Optional[bytes] = None,
+    allow_small_updates: bool = False,
 ) -> str:
     """Back up a chart and write an eligible GAP suggestion."""
     return write_chart_updates(
@@ -2606,12 +2634,18 @@ def write_gap_update(
         write_gap=True,
         write_bpm=False,
         preserved_backup=preserved_backup,
+        allow_small_updates=allow_small_updates,
     )[0]
 
 
-def write_bpm_update(result: Analysis) -> str:
+def write_bpm_update(result: Analysis, allow_small_updates: bool = False) -> str:
     """Back up a chart and write an eligible BPM suggestion."""
-    return write_chart_updates(result, write_gap=False, write_bpm=True)[1]
+    return write_chart_updates(
+        result,
+        write_gap=False,
+        write_bpm=True,
+        allow_small_updates=allow_small_updates,
+    )[1]
 
 
 def reanalyze_after_bpm_update(
@@ -2677,6 +2711,7 @@ def reanalyze_after_bpm_update(
         result.gap_write_status = write_gap_update(
             result,
             preserved_backup=preserved_backup,
+            allow_small_updates=getattr(args, "allow_small_updates", False),
         )
     return result
 
@@ -2684,11 +2719,17 @@ def reanalyze_after_bpm_update(
 def write_first_pass_chart_updates(result: Analysis, args: argparse.Namespace) -> bool:
     """Write eligible first-pass values and report whether BPM changed."""
     if args.write_bpm:
-        result.bpm_write_status = write_bpm_update(result)
+        result.bpm_write_status = write_bpm_update(
+            result,
+            allow_small_updates=getattr(args, "allow_small_updates", False),
+        )
         if result.bpm_write_status.startswith("Updated #BPM "):
             return True
     if args.write_gap:
-        result.gap_write_status = write_gap_update(result)
+        result.gap_write_status = write_gap_update(
+            result,
+            allow_small_updates=getattr(args, "allow_small_updates", False),
+        )
     return False
 
 
@@ -2735,6 +2776,7 @@ def format_summary_report(
         lines.extend([
             f"Version: {VERSION}",
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Command line: {getattr(args, 'command_line', 'Not captured')}",
             "",
             f"Match threshold: {args.match_threshold:.2f}",
             f"WhisperX batch size: {args.batch_size}",
@@ -2744,6 +2786,13 @@ def format_summary_report(
                 "Writing #BPM also enables #GAP writing; a successful BPM "
                 "update triggers a second analysis pass before GAP is written."
                 if args.write_bpm
+                else ""
+            ),
+            (
+                "--allow-small-updates was supplied: the normal GAP and BPM "
+                "size thresholds are bypassed; write options, confidence, and "
+                "all other safeguards still apply."
+                if getattr(args, "allow_small_updates", False)
                 else ""
             ),
             "",
@@ -2867,6 +2916,7 @@ def format_report(
             "=" * 78,
             f"Version: {VERSION}",
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Command line: {getattr(args, 'command_line', 'Not captured')}",
             "",
             (
                 "Safety: source audio and chart files were read only."
@@ -2885,6 +2935,13 @@ def format_report(
                 "Writing #BPM also enables #GAP writing; a successful BPM "
                 "update triggers a second analysis pass before GAP is written."
                 if args.write_bpm
+                else ""
+            ),
+            (
+                "--allow-small-updates was supplied: the normal GAP and BPM "
+                "size thresholds are bypassed; write options, confidence, and "
+                "all other safeguards still apply."
+                if getattr(args, "allow_small_updates", False)
                 else ""
             ),
             "BPM verification can sample later sections without transcribing the full song.",
@@ -3338,12 +3395,21 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--allow-small-updates",
+        action="store_true",
+        help=(
+            "Allow GAP and BPM writes below their normal size thresholds; "
+            "all other write safeguards still apply."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Include full exception tracebacks in the report.",
     )
 
     args = parser.parse_args()
+    args.command_line = shlex.join([sys.executable, *sys.argv])
 
     if not 0.0 <= args.match_threshold <= 1.0:
         parser.error("--match-threshold must be between 0 and 1.")

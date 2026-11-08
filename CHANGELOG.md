@@ -2,6 +2,14 @@
 
 Notable user-facing changes are listed here, grouped by project version.
 
+## 0.3.2
+
+- Add `--allow-small-updates` to permit below-threshold GAP and BPM writes
+  without bypassing confidence or other safeguards.
+- Include the full command line in reports and explain when the option permits
+  a small update.
+- Clarify that estimates may be imperfect and should be verified when possible.
+
 ## 0.3.1
 
 - Preserve replaced chart `.bak` files in a `backups/` directory using local
