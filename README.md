@@ -215,6 +215,11 @@ enable chart updates for a larger run.
   confidence, large corrections, and timing-drift warnings. The right balance
   depends on how many songs need review and how much time you can spend.
 
+When writing updates, the tool skips GAP changes smaller than 100 ms and BPM
+changes smaller than 0.5%. These thresholds help with large catalogues by
+avoiding chart edits for small adjustments, making it easier to see which song
+files were meaningfully changed.
+
 BPM analysis is optional (`--bpm`) and samples selected parts of each song.
 Check BPM suggestions and their separate BPM confidence in the main report;
 the companion `_review` report is focused on GAP corrections and timing-drift
@@ -327,8 +332,13 @@ written normally. When only GAP is eligible, it is written from the first pass.
 If the second analysis fails, the BPM update remains, but GAP is not written;
 the report identifies the failed reanalysis.
 Before changing a chart, the tool refreshes a sibling backup named
-`<chart-stem>.bak` (for example, `song.bak` for `song.txt`). Audio files are never
-modified. Review the report and keep backups before enabling chart updates.
+`<chart-stem>.bak` (for example, `song.bak` for `song.txt`). If that backup
+already exists, it is moved into a `backups/` subdirectory before the latest
+backup is created. Archived names start with the local date and time in
+`YYYY-MM-DD-THH-MM-SS` format, followed by a sequence number and the original
+`.bak` filename, for example `backups/2026-11-08-T11-33-56_000_song.bak`.
+Existing archive files are never overwritten. Audio files are never modified.
+Review the report and keep backups before enabling chart updates.
 
 When a BPM correction is available, reports also show its signed percentage
 relative to the current BPM: `(suggested BPM - current BPM) / current BPM ×

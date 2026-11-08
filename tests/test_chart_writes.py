@@ -1,4 +1,5 @@
 import contextlib
+from datetime import datetime
 import io
 import tempfile
 import unittest
@@ -9,6 +10,155 @@ from karaoke_txt_song_timing_analysis import karaoke_txt_song_timing_analysis as
 
 
 class ChartWriteTests(unittest.TestCase):
+    def test_existing_backup_is_archived_before_latest_backup_is_refreshed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#GAP: 100\n"
+            previous_backup = b"#TITLE:Older version\n#GAP: 80\n"
+            chart_path.write_bytes(original)
+            chart_path.with_suffix(".bak").write_bytes(previous_backup)
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analyzed",
+                suggested_gap_ms=250,
+                confidence="High",
+            )
+
+            with patch.object(analysis, "datetime") as mocked_datetime:
+                mocked_datetime.now.return_value = datetime(
+                    2026,
+                    11,
+                    8,
+                    11,
+                    33,
+                    56,
+                )
+                status = analysis.write_gap_update(result)
+
+            archived_backup = (
+                chart_path.parent
+                / "backups"
+                / "2026-11-08-T11-33-56_000_song.bak"
+            )
+            self.assertIn(f"previous backup archived to {archived_backup}", status)
+            self.assertEqual(archived_backup.read_bytes(), previous_backup)
+            self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), original)
+            self.assertEqual(chart_path.read_bytes(), b"#TITLE:Song\n#GAP: 250\n")
+
+    def test_archive_name_collision_uses_next_sequence_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#GAP: 100\n"
+            previous_backup = b"#TITLE:Older version\n#GAP: 80\n"
+            collision_content = b"existing archive"
+            chart_path.write_bytes(original)
+            chart_path.with_suffix(".bak").write_bytes(previous_backup)
+            archive_directory = chart_path.parent / "backups"
+            archive_directory.mkdir()
+            first_archive = archive_directory / "2026-11-08-T11-33-56_000_song.bak"
+            first_archive.write_bytes(collision_content)
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analyzed",
+                suggested_gap_ms=250,
+                confidence="High",
+            )
+
+            with patch.object(analysis, "datetime") as mocked_datetime:
+                mocked_datetime.now.return_value = datetime(
+                    2026,
+                    11,
+                    8,
+                    11,
+                    33,
+                    56,
+                )
+                analysis.write_gap_update(result)
+
+            second_archive = archive_directory / "2026-11-08-T11-33-56_001_song.bak"
+            self.assertEqual(first_archive.read_bytes(), collision_content)
+            self.assertEqual(second_archive.read_bytes(), previous_backup)
+
+    def test_successive_updates_preserve_each_previous_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#GAP: 100\n"
+            older_backup = b"#TITLE:Older version\n#GAP: 80\n"
+            chart_path.write_bytes(original)
+            chart_path.with_suffix(".bak").write_bytes(older_backup)
+            first_result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analyzed",
+                suggested_gap_ms=250,
+                confidence="High",
+            )
+            second_result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=250,
+                bpm=120,
+                status="Analyzed",
+                suggested_gap_ms=400,
+                confidence="High",
+            )
+
+            with patch.object(analysis, "datetime") as mocked_datetime:
+                mocked_datetime.now.side_effect = [
+                    datetime(2026, 11, 8, 11, 33, 56),
+                    datetime(2026, 11, 8, 11, 33, 57),
+                ]
+                first_status = analysis.write_gap_update(first_result)
+                second_status = analysis.write_gap_update(second_result)
+
+            archive_directory = chart_path.parent / "backups"
+            first_archive = archive_directory / "2026-11-08-T11-33-56_000_song.bak"
+            second_archive = archive_directory / "2026-11-08-T11-33-57_000_song.bak"
+            self.assertIn(f"previous backup archived to {first_archive}", first_status)
+            self.assertIn(f"previous backup archived to {second_archive}", second_status)
+            self.assertEqual(first_archive.read_bytes(), older_backup)
+            self.assertEqual(second_archive.read_bytes(), original)
+            self.assertEqual(
+                chart_path.with_suffix(".bak").read_bytes(),
+                b"#TITLE:Song\n#GAP: 250\n",
+            )
+            self.assertEqual(chart_path.read_bytes(), b"#TITLE:Song\n#GAP: 400\n")
+
+    def test_archive_failure_preserves_chart_and_latest_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            chart_path = Path(temporary_directory) / "song.txt"
+            original = b"#TITLE:Song\n#GAP: 100\n"
+            previous_backup = b"#TITLE:Older version\n#GAP: 80\n"
+            chart_path.write_bytes(original)
+            chart_path.with_suffix(".bak").write_bytes(previous_backup)
+            (chart_path.parent / "backups").write_text(
+                "not a directory",
+                encoding="utf-8",
+            )
+            result = analysis.Analysis(
+                chart_path=chart_path,
+                audio_path=None,
+                old_gap_ms=100,
+                bpm=120,
+                status="Analyzed",
+                suggested_gap_ms=250,
+                confidence="High",
+            )
+
+            status = analysis.write_gap_update(result)
+
+            self.assertIn("Failed to update chart", status)
+            self.assertEqual(chart_path.read_bytes(), original)
+            self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), previous_backup)
+
     def test_write_bpm_updates_chart_and_keeps_original_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             chart_path = Path(temporary_directory) / "song.txt"
@@ -34,7 +184,9 @@ class ChartWriteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             chart_path = Path(temporary_directory) / "song.txt"
             original = b"#TITLE:Song\n#GAP: 100\n#BPM: 120\n"
+            previous_backup = b"#TITLE:Previous\n#GAP: 50\n#BPM: 100\n"
             chart_path.write_bytes(original)
+            chart_path.with_suffix(".bak").write_bytes(previous_backup)
             result = analysis.Analysis(
                 chart_path=chart_path,
                 audio_path=None,
@@ -63,12 +215,17 @@ class ChartWriteTests(unittest.TestCase):
                 b"#TITLE:Song\n#GAP: 250\n#BPM: 121.250\n",
             )
             self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), original)
+            archived_backups = list((chart_path.parent / "backups").glob("*.bak"))
+            self.assertEqual(len(archived_backups), 1)
+            self.assertEqual(archived_backups[0].read_bytes(), previous_backup)
 
     def test_bpm_write_reanalyzes_before_writing_gap_and_preserves_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             chart_path = Path(temporary_directory) / "song.txt"
             original = b"#TITLE:Song\n#GAP: 100\n#BPM: 120\n"
+            previous_backup = b"#TITLE:Previous\n#GAP: 50\n#BPM: 100\n"
             chart_path.write_bytes(original)
+            chart_path.with_suffix(".bak").write_bytes(previous_backup)
             first_pass = analysis.Analysis(
                 chart_path=chart_path,
                 audio_path=None,
@@ -129,6 +286,9 @@ class ChartWriteTests(unittest.TestCase):
                 b"#TITLE:Song\n#GAP: 250\n#BPM: 120.600\n",
             )
             self.assertEqual(chart_path.with_suffix(".bak").read_bytes(), original)
+            archived_backups = list((chart_path.parent / "backups").glob("*.bak"))
+            self.assertEqual(len(archived_backups), 1)
+            self.assertEqual(archived_backups[0].read_bytes(), previous_backup)
             self.assertTrue(
                 any("Second analysis pass ran" in note for note in result.bpm_sample_notes)
             )

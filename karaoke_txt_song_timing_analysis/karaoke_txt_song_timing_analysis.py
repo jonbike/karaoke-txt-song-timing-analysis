@@ -2241,6 +2241,65 @@ def analyze_charts_on_both_devices(
             executor.shutdown(wait=True, cancel_futures=True)
 
 
+def archive_existing_backup(backup_path: Path) -> Optional[Path]:
+    """Move an existing latest backup into a timestamped history directory."""
+    if not backup_path.exists():
+        return None
+
+    archive_directory = backup_path.parent / "backups"
+    archive_directory.mkdir(exist_ok=True)
+    if archive_directory.is_symlink() or not archive_directory.is_dir():
+        raise OSError(
+            f"Backup archive path is not a regular directory: {archive_directory}"
+        )
+
+    timestamp = datetime.now().strftime("%Y-%m-%d-T%H-%M-%S")
+    sequence = 0
+    while True:
+        archive_path = archive_directory / (
+            f"{timestamp}_{sequence:03d}_{backup_path.name}"
+        )
+        try:
+            archive_file = archive_path.open("xb")
+        except FileExistsError:
+            sequence += 1
+            continue
+        try:
+            with archive_file, backup_path.open("rb") as source:
+                shutil.copyfileobj(source, archive_file)
+                archive_file.flush()
+                os.fsync(archive_file.fileno())
+            shutil.copystat(backup_path, archive_path)
+            if archive_path.read_bytes() != backup_path.read_bytes():
+                raise OSError(
+                    f"Archived backup does not match the previous backup: "
+                    f"{archive_path}"
+                )
+            backup_path.unlink()
+        except OSError as exc:
+            try:
+                archive_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                raise OSError(
+                    f"{exc}; could not remove incomplete archive {archive_path}: "
+                    f"{cleanup_error}"
+                ) from exc
+            raise
+        return archive_path
+
+
+def backup_details(
+    backup_path: Path,
+    archived_backup_path: Optional[Path],
+) -> str:
+    if archived_backup_path is None:
+        return f"backup: {backup_path}"
+    return (
+        f"previous backup archived to {archived_backup_path}; "
+        f"latest backup: {backup_path}"
+    )
+
+
 def write_chart_updates(
     result: Analysis,
     write_gap: bool,
@@ -2428,12 +2487,33 @@ def write_chart_updates(
         )
 
     temporary_path: Optional[Path] = None
+    backup_temporary_path: Optional[Path] = None
+    archived_backup_path: Optional[Path] = None
     update_error: Optional[OSError] = None
     cleanup_error: Optional[OSError] = None
     try:
         if preserved_backup is None:
-            shutil.copy2(chart_path, backup_path)
             expected_backup = original
+            descriptor, backup_temporary_name = tempfile.mkstemp(
+                prefix=f".{backup_path.name}.",
+                suffix=".tmp",
+                dir=chart_path.parent,
+            )
+            backup_temporary_path = Path(backup_temporary_name)
+            os.close(descriptor)
+            shutil.copy2(chart_path, backup_temporary_path)
+            if backup_temporary_path.read_bytes() != expected_backup:
+                failure = (
+                    "Skipped: chart contents changed while preparing the backup; "
+                    f"the refreshed backup is {backup_path}."
+                )
+                return (
+                    failure if any(field == "#GAP" for field, *_ in updates) else gap_status,
+                    failure if any(field == "#BPM" for field, *_ in updates) else bpm_status,
+                )
+            archived_backup_path = archive_existing_backup(backup_path)
+            os.replace(backup_temporary_path, backup_path)
+            backup_temporary_path = None
         else:
             expected_backup = preserved_backup
         if backup_path.read_bytes() != expected_backup:
@@ -2465,12 +2545,19 @@ def write_chart_updates(
                 temporary_path.unlink(missing_ok=True)
             except OSError as exc:
                 cleanup_error = exc
+        if backup_temporary_path is not None:
+            try:
+                backup_temporary_path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_error = exc
 
     if update_error is not None:
         failure = (
             f"Failed to update chart: {type(update_error).__name__}: "
             f"{update_error}"
         )
+        if archived_backup_path is not None:
+            failure += f" Previous backup archived to {archived_backup_path}."
         if backup_path.exists():
             failure += f" Backup: {backup_path}"
         for field_name, *_ in updates:
@@ -2483,12 +2570,13 @@ def write_chart_updates(
             if field_name == "#GAP":
                 status = (
                     f"Updated #GAP from {format_ms(current_value)} to "
-                    f"{format_ms(float(new_value_text))}; backup: {backup_path}."
+                    f"{format_ms(float(new_value_text))}; "
+                    f"{backup_details(backup_path, archived_backup_path)}."
                 )
             else:
                 status = (
                     f"Updated #BPM from {current_value:g} to {new_value_text}; "
-                    f"backup: {backup_path}."
+                    f"{backup_details(backup_path, archived_backup_path)}."
                 )
             if field_name == "#GAP":
                 gap_status = status

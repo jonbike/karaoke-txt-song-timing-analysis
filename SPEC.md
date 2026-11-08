@@ -290,8 +290,12 @@ outcomes clear.
    is updated, follow the two-pass sequence in rule 3 and preserve the original
    backup for the later GAP write.
 5. Before replacing a chart, refresh the sibling `<chart-stem>.bak` backup and
-   verify it matches the bytes read for the update. Refuse to replace chart or
-   backup symlinks.
+   verify it matches the bytes read for the update. If that backup already
+   exists, preserve it in a `backups/` subdirectory using a local-time,
+   filename-sortable `YYYY-MM-DD-THH-MM-SS` timestamp followed by a
+   collision-safe sequence number and the original backup filename. Never
+   overwrite an archived backup.
+   Refuse to replace chart or backup symlinks.
 6. Write through a temporary file in the chart directory and atomically
    replace the chart. Preserve the chart's file mode and line endings. Never
    modify audio.
