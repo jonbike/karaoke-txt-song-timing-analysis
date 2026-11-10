@@ -26,12 +26,7 @@ decrease #GAP.
 from __future__ import annotations
 
 import argparse
-from collections import deque
-from collections.abc import Iterator
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import difflib
-from datetime import datetime, timedelta
 import io
 import math
 import multiprocessing
@@ -48,13 +43,23 @@ import threading
 import time
 import tomllib
 import traceback
-
+from collections import deque
+from collections.abc import Iterator
+from multiprocessing.process import BaseProcess
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from korean_romanizer import Romanizer
-
 
 PROJECT_FILE = Path(__file__).resolve().parents[1] / "pyproject.toml"
 with PROJECT_FILE.open("rb") as project_file:
@@ -70,7 +75,7 @@ NOTE_RE = re.compile(
 ANY_NOTE_RE = re.compile(r"^([^\s:#-])\s+-?\d+\s+\d+\s+-?\d+\s+.*$")
 
 NUMBER_RE = r"[+-]?\d+(?:[.,]\d+)?"
-GAP_RE = re.compile(rf"^\s*#GAP:\s*({NUMBER_RE})", re.I)
+GAP_RE = re.compile(rf"^\s*#GAP:\s*({NUMBER_RE})", re.IGNORECASE)
 AUDIO_SUFFIXES = {
     ".mp3",
     ".m4a",
@@ -82,23 +87,23 @@ AUDIO_SUFFIXES = {
     ".mp4",
 }
 MIN_GAP_WRITE_CHANGE_MS = 100.0
-MIN_BPM_WRITE_CHANGE_PERCENT = 0.5
+MIN_BPM_WRITE_CHANGE_PERCENT = 0.35
 GAP_BYTES_RE = re.compile(
     rb"^(\xef\xbb\xbf)?([ \t]*#GAP:[ \t]*)"
     rb"([+-]?\d+(?:[.,]\d+)?)([ \t]*(?:\r?\n)?)$",
-    re.I,
+    re.IGNORECASE,
 )
 BPM_BYTES_RE = re.compile(
     rb"^(\xef\xbb\xbf)?([ \t]*#BPM:[ \t]*)"
     rb"([+-]?\d+(?:[.,]\d+)?)([ \t]*(?:\r?\n)?)$",
-    re.I,
+    re.IGNORECASE,
 )
-BPM_RE = re.compile(rf"^\s*#BPM:\s*({NUMBER_RE})", re.I)
-AUDIO_RE = re.compile(r"^\s*#AUDIO:\s*(.*?)\s*$", re.I)
-MP3_RE = re.compile(r"^\s*#MP3:\s*(.*?)\s*$", re.I)
-RELATIVE_RE = re.compile(r"^\s*#RELATIVE:\s*(.*?)\s*$", re.I)
+BPM_RE = re.compile(rf"^\s*#BPM:\s*({NUMBER_RE})", re.IGNORECASE)
+AUDIO_RE = re.compile(r"^\s*#AUDIO:\s*(.*?)\s*$", re.IGNORECASE)
+MP3_RE = re.compile(r"^\s*#MP3:\s*(.*?)\s*$", re.IGNORECASE)
+RELATIVE_RE = re.compile(r"^\s*#RELATIVE:\s*(.*?)\s*$", re.IGNORECASE)
 
-TOKEN_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)?", re.I)
+TOKEN_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)?", re.IGNORECASE)
 HANGUL_RE = re.compile(
     r"[\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7af\ud7b0-\ud7ff]"
 )
@@ -117,6 +122,8 @@ MAX_BPM_STRONG_SAMPLE_SPREAD_MS = 200.0
 
 @dataclass
 class ChartWord:
+    """A normalized lyric word and its chart timing."""
+
     text: str
     beat: float
     seconds: float
@@ -125,6 +132,8 @@ class ChartWord:
 
 @dataclass
 class AudioWord:
+    """A transcribed word and its audio timestamps."""
+
     text: str
     start: float
     end: float
@@ -133,6 +142,8 @@ class AudioWord:
 
 @dataclass
 class Match:
+    """A chart-to-audio word match and its estimated GAP."""
+
     chart: ChartWord
     audio: AudioWord
     similarity: float
@@ -140,11 +151,14 @@ class Match:
 
     @property
     def audio_time(self) -> float:
+        """Return the matched audio word's start time."""
         return self.audio.start
 
 
 @dataclass
 class BpmSample:
+    """A sampled chart-time offset used to estimate BPM correction."""
+
     label: str
     chart_time_seconds: float
     offset_ms: float
@@ -154,6 +168,8 @@ class BpmSample:
 
 @dataclass
 class BpmSampleDiagnostic:
+    """Detailed transcription and alignment data for one BPM sample."""
+
     label: str
     audio_start: float
     audio_end: float
@@ -166,26 +182,32 @@ class BpmSampleDiagnostic:
 
 @dataclass
 class Analysis:
+    """Analysis results, diagnostics, and write statuses for one chart."""
+
     chart_path: Path
-    audio_path: Optional[Path]
-    old_gap_ms: Optional[float]
-    bpm: Optional[float]
+    audio_path: Path | None
+    old_gap_ms: float | None
+    bpm: float | None
     status: str
+    original_gap_ms: float | None = None
+    current_gap_ms: float | None = None
+    original_bpm: float | None = None
+    current_bpm: float | None = None
     transcription: str = ""
-    matches: Optional[list[Match]] = None
-    suggested_gap_ms: Optional[float] = None
-    correction_ms: Optional[float] = None
+    matches: list[Match] | None = None
+    suggested_gap_ms: float | None = None
+    correction_ms: float | None = None
     confidence: str = "Not assessed"
     reason: str = ""
     gap_drift_warning: str = ""
-    audio_duration: Optional[float] = None
-    audio_opening_seconds: Optional[float] = None
-    chart_opening_seconds: Optional[float] = None
-    chart_words: Optional[list[ChartWord]] = None
-    unknown_note_types: Optional[list[tuple[str, int]]] = None
-    bpm_samples: Optional[list[BpmSample]] = None
-    suggested_bpm: Optional[float] = None
-    bpm_correction: Optional[float] = None
+    audio_duration: float | None = None
+    audio_opening_seconds: float | None = None
+    chart_opening_seconds: float | None = None
+    chart_words: list[ChartWord] | None = None
+    unknown_note_types: list[tuple[str, int]] | None = None
+    bpm_samples: list[BpmSample] | None = None
+    suggested_bpm: float | None = None
+    bpm_correction: float | None = None
     bpm_confidence: str = "Not assessed"
     bpm_reason: str = ""
     bpm_write_block_reason: str = ""
@@ -197,11 +219,13 @@ class Analysis:
 
 @dataclass
 class ChartAnalysisOutput:
+    """A chart analysis result together with captured worker logs."""
+
     analysis: Analysis
     logs: str = ""
 
 
-_ACTIVE_CHILD_PROCESSES: set[multiprocessing.Process] = set()
+_ACTIVE_CHILD_PROCESSES: set[BaseProcess] = set()
 _ACTIVE_CHILD_PROCESSES_LOCK = threading.Lock()
 _CHART_PROCESS_TERMINATION_REQUESTED = threading.Event()
 
@@ -212,6 +236,7 @@ def normalize_word(text: str) -> str:
 
 
 def tokens(text: str) -> list[str]:
+    """Return normalized word tokens, omitting tokens with no letters or digits."""
     return [normalize_word(x) for x in TOKEN_RE.findall(text) if normalize_word(x)]
 
 
@@ -256,8 +281,8 @@ def select_gap_opening_windows(
 def estimate_completion_time(
     song_durations: list[float],
     remaining_songs: int,
-    now: Optional[datetime] = None,
-) -> Optional[datetime]:
+    now: datetime | None = None,
+) -> datetime | None:
     """Estimate completion using the most recent completed song durations."""
     if not song_durations:
         return None
@@ -272,8 +297,8 @@ def estimate_parallel_completion_time(
     elapsed_seconds: float,
     completed_songs: int,
     total_songs: int,
-    now: Optional[datetime] = None,
-) -> Optional[datetime]:
+    now: datetime | None = None,
+) -> datetime | None:
     """Estimate completion from the dual-device run's observed throughput."""
     if completed_songs <= 0 or total_songs < completed_songs:
         return None
@@ -287,7 +312,7 @@ def estimate_parallel_completion_time(
 
 def format_estimated_end(
     estimated_end: datetime,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
 ) -> str:
     """Format an estimated end time with a day offset when needed."""
     current_date = (now or datetime.now()).date()
@@ -301,7 +326,7 @@ def format_estimated_end(
 def prepare_audio_words_for_matching(
     audio_words: list[AudioWord],
     chart_words: list[ChartWord],
-    detected_language: Optional[str],
+    detected_language: str | None,
 ) -> list[AudioWord]:
     """Romanize Korean audio words when chart lyrics use Latin characters."""
     language_code = (detected_language or "").casefold().split("-", maxsplit=1)[0]
@@ -385,7 +410,7 @@ def detect_unknown_note_types(path: Path) -> list[tuple[str, int]]:
     return unknown
 
 
-def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[ChartWord]]:
+def parse_chart(path: Path) -> tuple[float | None, float | None, list[ChartWord]]:
     """Read BPM, GAP and reconstruct complete lyric words from note fragments.
 
     UltraStar note text may be a syllable rather than a whole word. A trailing
@@ -397,7 +422,7 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
     gap_ms = None
     raw_words: list[tuple[str, float]] = []
     pending_text = ""
-    pending_beat: Optional[float] = None
+    pending_beat: float | None = None
     relative_timing = False
     previous_start_beat = 0.0
 
@@ -406,6 +431,7 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
         return float(value.replace(",", "."))
 
     def flush_pending_word() -> None:
+        """Store the accumulated lyric fragments as one complete word."""
         nonlocal pending_text, pending_beat
         word = normalize_word(pending_text)
         if word and pending_beat is not None:
@@ -491,10 +517,10 @@ def parse_chart(path: Path) -> tuple[Optional[float], Optional[float], list[Char
     return gap_ms, bpm, words
 
 
-def read_audio_reference(chart_path: Path) -> tuple[Optional[str], Optional[str]]:
+def read_audio_reference(chart_path: Path) -> tuple[str | None, str | None]:
     """Read #AUDIO preferentially, with legacy #MP3 support."""
-    audio_value: Optional[str] = None
-    mp3_value: Optional[str] = None
+    audio_value: str | None = None
+    mp3_value: str | None = None
     for line in read_chart_text(chart_path).splitlines():
         match = AUDIO_RE.match(line)
         if match and audio_value is None:
@@ -512,13 +538,13 @@ def read_audio_reference(chart_path: Path) -> tuple[Optional[str], Optional[str]
     return None, None
 
 
-def read_mp3_reference(chart_path: Path) -> Optional[str]:
+def read_mp3_reference(chart_path: Path) -> str | None:
     """Compatibility wrapper returning the selected audio filename."""
     _tag, value = read_audio_reference(chart_path)
     return value
 
 
-def resolve_case_insensitive(path: Path) -> Optional[Path]:
+def resolve_case_insensitive(path: Path) -> Path | None:
     """Resolve a path exactly first, then case-insensitively for Linux systems."""
     if path.exists() and path.is_file():
         return path
@@ -553,7 +579,7 @@ def resolve_case_insensitive(path: Path) -> Optional[Path]:
         return None
 
 
-def find_audio_for_chart(chart_path: Path) -> Optional[Path]:
+def find_audio_for_chart(chart_path: Path) -> Path | None:
     """Find audio from #AUDIO or legacy #MP3; otherwise use same-basename lookup."""
     _reference_tag, audio_reference = read_audio_reference(chart_path)
 
@@ -636,18 +662,18 @@ def is_existing_ultrastar_chart(path: Path) -> bool:
 def transcribe_audio_windows(
     audio_path: Path,
     model_name: str,
-    language: Optional[str],
+    language: str | None,
     device: str,
     compute_type: str,
     batch_size: int,
     opening_seconds: float,
     extra_windows: list[tuple[str, float, float]],
-    model: Optional[Any] = None,
+    model: Any | None = None,
 ) -> tuple[
     list[AudioWord],
     float,
     str,
-    Optional[str],
+    str | None,
     dict[str, list[AudioWord]],
     dict[str, str],
     Any,
@@ -806,7 +832,7 @@ def transcribe_audio_windows(
 def estimate_bpm_from_samples(
     samples: list[BpmSample],
     current_bpm: float,
-) -> tuple[Optional[float], Optional[float], str, str]:
+) -> tuple[float | None, float | None, str, str]:
     """Robustly estimate BPM from the slope of audio-vs-chart timing offsets."""
     usable = [
         sample for sample in samples
@@ -824,8 +850,10 @@ def estimate_bpm_from_samples(
     if len(estimation_samples) < 2:
         return (
             None, None, "Low",
-            f"Only {len(estimation_samples)} reliable timing samples; "
-            "at least 2 are needed.",
+            (
+                f"Only {len(estimation_samples)} reliable timing samples; "
+                "at least 2 are needed."
+            ),
         )
 
     span = max(s.chart_time_seconds for s in estimation_samples) - min(
@@ -924,8 +952,8 @@ def estimate_bpm_from_samples(
         reason = (
             f"The timing-drift trend is inconsistent. {sample_summary}"
         )
-
     return suggested, correction, confidence, reason
+
 
 def local_alignment(
     chart_words: list[ChartWord],
@@ -1078,6 +1106,7 @@ def greedy_ordered_alignment(
 
 
 def median_absolute_deviation(values: list[float]) -> float:
+    """Return the median distance from the median, or infinity if empty."""
     if not values:
         return float("inf")
 
@@ -1184,7 +1213,7 @@ def count_supported_informative_phrases(
         key=lambda item: item[0].chart.seconds,
     )
     phrase_counts: list[int] = []
-    previous_match: Optional[Match] = None
+    previous_match: Match | None = None
 
     for match, weight in ordered:
         if (
@@ -1255,7 +1284,7 @@ def evaluate_matches(
     old_gap_ms: float,
     threshold: float,
     max_correction_ms: float,
-) -> tuple[Optional[float], Optional[float], str, str]:
+) -> tuple[float | None, float | None, str, str]:
     """
     Estimate the new GAP and decide whether the evidence is usable.
 
@@ -1287,7 +1316,7 @@ def evaluate_matches(
     ordered_matches = sorted(matches, key=lambda match: match.chart.seconds)
     if len(ordered_matches) >= 2:
         # A phrase boundary is approximated by a gap in chart timing.
-        for previous, current in zip(ordered_matches, ordered_matches[1:]):
+        for previous, current in pairwise(ordered_matches):
             if current.chart.seconds - previous.chart.seconds > 0.65:
                 distinct_phrases += 1
 
@@ -1327,8 +1356,10 @@ def evaluate_matches(
             suggested_gap,
             correction,
             "Low",
-            "Too few context-supported informative word matches; matches "
-            "must agree with nearby lyric timings.",
+            (
+                "Too few context-supported informative word matches; matches "
+                "must agree with nearby lyric timings."
+            ),
         )
 
     if spread > 1500:
@@ -1336,8 +1367,10 @@ def evaluate_matches(
             suggested_gap,
             correction,
             "Low",
-            f"Match timing is inconsistent (median absolute deviation "
-            f"{spread:.0f} ms).",
+            (
+                f"Match timing is inconsistent (median absolute deviation "
+                f"{spread:.0f} ms)."
+            ),
         )
 
     if abs(correction) > max_correction_ms:
@@ -1345,8 +1378,10 @@ def evaluate_matches(
             suggested_gap,
             correction,
             "Low",
-            f"Proposed correction {correction:+.0f} ms exceeds the allowed "
-            f"limit of {max_correction_ms:.0f} ms.",
+            (
+                f"Proposed correction {correction:+.0f} ms exceeds the allowed "
+                f"limit of {max_correction_ms:.0f} ms."
+            ),
         )
 
     # Lower confidence is expected for fuzzy singing recognition. The
@@ -1387,7 +1422,7 @@ def evaluate_matches(
     return suggested_gap, correction, confidence, "; ".join(reasons)
 
 
-def summarize_bpm_sample(label: str, matches: list[Match]) -> Optional[BpmSample]:
+def summarize_bpm_sample(label: str, matches: list[Match]) -> BpmSample | None:
     """Summarize a sample using its median timing offset and match spread."""
     if len(matches) < 3:
         return None
@@ -1418,8 +1453,10 @@ def select_bpm_sample_windows(
     chart_span = chart_end - chart_start
     if chart_span < 45.0:
         return [], [
-            f"Skipped later samples: lyric timeline spans only "
-            f"{chart_span:.1f}s; at least 45s is required."
+            (
+                f"Skipped later samples: lyric timeline spans only "
+                f"{chart_span:.1f}s; at least 45s is required."
+            )
         ]
 
     clusters: list[list[ChartWord]] = []
@@ -1584,6 +1621,7 @@ def analyze_chart(
     chart_path: Path,
     args: argparse.Namespace,
 ) -> Analysis:
+    """Prepare a chart's audio, then analyze its GAP and optional BPM."""
     gap_ms, bpm, chart_words = parse_chart(chart_path)
     audio_path = find_audio_for_chart(chart_path)
     if (
@@ -1648,9 +1686,10 @@ def analyze_chart(
 def _analyze_chart_with_audio(
     chart_path: Path,
     args: argparse.Namespace,
-    transcription_audio_path: Optional[Path] = None,
-    opening_windows: Optional[tuple[float, float]] = None,
+    transcription_audio_path: Path | None = None,
+    opening_windows: tuple[float, float] | None = None,
 ) -> Analysis:
+    """Transcribe and align chart audio, then estimate timing corrections."""
     gap_ms, bpm, chart_words = parse_chart(chart_path)
     unknown_note_types = detect_unknown_note_types(chart_path)
     audio_path = find_audio_for_chart(chart_path)
@@ -1947,6 +1986,7 @@ def _analyze_chart_worker(
     args: argparse.Namespace,
     capture_output: bool,
 ) -> None:
+    """Analyze one chart in a child process and send its result to the parent."""
     output = io.StringIO()
     stdout_context = redirect_stdout(output) if capture_output else nullcontext()
     stderr_context = redirect_stderr(output) if capture_output else nullcontext()
@@ -1974,6 +2014,7 @@ def analyze_chart_in_child_process(
     chart_path: Path,
     args: argparse.Namespace,
 ) -> Analysis:
+    """Run chart analysis in a child process and return its result."""
     return _run_chart_in_child_process(
         chart_path,
         args,
@@ -1985,6 +2026,7 @@ def analyze_chart_in_child_process_capturing_output(
     chart_path: Path,
     args: argparse.Namespace,
 ) -> ChartAnalysisOutput:
+    """Run chart analysis in a child process and capture its console output."""
     return _run_chart_in_child_process(
         chart_path,
         args,
@@ -1997,6 +2039,7 @@ def _run_chart_in_child_process(
     args: argparse.Namespace,
     capture_output: bool,
 ) -> ChartAnalysisOutput:
+    """Start a spawned worker, receive its result, and clean up its resources."""
     context = multiprocessing.get_context("spawn")
     receive_connection, send_connection = context.Pipe(duplex=False)
     process = context.Process(
@@ -2051,6 +2094,7 @@ def _run_chart_in_child_process(
 
 
 def terminate_active_chart_processes() -> None:
+    """Request cancellation and terminate all registered chart workers."""
     with _ACTIVE_CHILD_PROCESSES_LOCK:
         _CHART_PROCESS_TERMINATION_REQUESTED.set()
         processes = list(_ACTIVE_CHILD_PROCESSES)
@@ -2122,6 +2166,7 @@ def _analyze_chart_on_device(
     args: argparse.Namespace,
     device: str,
 ) -> ChartAnalysisOutput:
+    """Analyze a chart on one device, converting worker errors to a result."""
     worker_args = argparse.Namespace(**vars(args))
     worker_args.device = device
     if not args.compute_type_explicit:
@@ -2150,6 +2195,7 @@ def analyze_charts_on_both_devices(
     chart_paths: list[Path],
     args: argparse.Namespace,
 ) -> Iterator[tuple[Path, ChartAnalysisOutput]]:
+    """Analyze charts concurrently on CPU and CUDA, retrying CUDA OOMs on CPU."""
     with _ACTIVE_CHILD_PROCESSES_LOCK:
         _CHART_PROCESS_TERMINATION_REQUESTED.clear()
 
@@ -2163,6 +2209,7 @@ def analyze_charts_on_both_devices(
     active_devices: set[str] = set()
 
     def submit(chart_path: Path, device: str, gpu_error: str = "") -> None:
+        """Schedule one chart on a device and record the active job."""
         worker_args = argparse.Namespace(**vars(args))
         if gpu_error:
             worker_args.compute_type = "int8"
@@ -2242,7 +2289,7 @@ def analyze_charts_on_both_devices(
             executor.shutdown(wait=True, cancel_futures=True)
 
 
-def archive_existing_backup(backup_path: Path) -> Optional[Path]:
+def archive_existing_backup(backup_path: Path) -> Path | None:
     """Move an existing latest backup into a timestamped history directory."""
     if not backup_path.exists():
         return None
@@ -2291,8 +2338,9 @@ def archive_existing_backup(backup_path: Path) -> Optional[Path]:
 
 def backup_details(
     backup_path: Path,
-    archived_backup_path: Optional[Path],
+    archived_backup_path: Path | None,
 ) -> str:
+    """Describe the latest backup and any prior backup moved to the archive."""
     if archived_backup_path is None:
         return f"backup: {backup_path}"
     return (
@@ -2305,7 +2353,7 @@ def write_chart_updates(
     result: Analysis,
     write_gap: bool,
     write_bpm: bool,
-    preserved_backup: Optional[bytes] = None,
+    preserved_backup: bytes | None = None,
     allow_small_updates: bool = False,
 ) -> tuple[str, str]:
     """Back up a chart once and atomically write eligible GAP/BPM suggestions."""
@@ -2470,7 +2518,7 @@ def write_chart_updates(
                 )
             ):
                 small_update_notes[field_name] = (
-                    "below the normal 0.50% threshold; written because "
+                    "below the normal 0.35% threshold; written because "
                     "--allow-small-updates was supplied"
                 )
 
@@ -2507,11 +2555,11 @@ def write_chart_updates(
             failure if any(field == "#BPM" for field, *_ in updates) else bpm_status,
         )
 
-    temporary_path: Optional[Path] = None
-    backup_temporary_path: Optional[Path] = None
-    archived_backup_path: Optional[Path] = None
-    update_error: Optional[OSError] = None
-    cleanup_error: Optional[OSError] = None
+    temporary_path: Path | None = None
+    backup_temporary_path: Path | None = None
+    archived_backup_path: Path | None = None
+    update_error: OSError | None = None
+    cleanup_error: OSError | None = None
     try:
         if preserved_backup is None:
             expected_backup = original
@@ -2625,27 +2673,46 @@ def write_chart_updates(
 
 def write_gap_update(
     result: Analysis,
-    preserved_backup: Optional[bytes] = None,
+    preserved_backup: bytes | None = None,
     allow_small_updates: bool = False,
 ) -> str:
     """Back up a chart and write an eligible GAP suggestion."""
-    return write_chart_updates(
+    if result.original_gap_ms is None:
+        result.original_gap_ms = result.old_gap_ms
+    if result.current_gap_ms is None:
+        result.current_gap_ms = result.old_gap_ms
+    status = write_chart_updates(
         result,
         write_gap=True,
         write_bpm=False,
         preserved_backup=preserved_backup,
         allow_small_updates=allow_small_updates,
     )[0]
+    if status.startswith("Updated #GAP "):
+        if result.suggested_gap_ms is not None:
+            result.current_gap_ms = float(f"{result.suggested_gap_ms:.0f}")
+    return status
 
 
 def write_bpm_update(result: Analysis, allow_small_updates: bool = False) -> str:
     """Back up a chart and write an eligible BPM suggestion."""
-    return write_chart_updates(
+    if result.original_bpm is None:
+        result.original_bpm = result.bpm
+    if result.current_bpm is None:
+        result.current_bpm = result.bpm
+    status = write_chart_updates(
         result,
         write_gap=False,
         write_bpm=True,
         allow_small_updates=allow_small_updates,
     )[1]
+    if status.startswith("Updated #BPM "):
+        result.current_bpm = (
+            float(f"{result.suggested_bpm:.3f}")
+            if result.suggested_bpm is not None
+            else result.current_bpm
+        )
+    return status
 
 
 def reanalyze_after_bpm_update(
@@ -2688,6 +2755,22 @@ def reanalyze_after_bpm_update(
             result.reason += "\n" + traceback.format_exc()
 
     result.bpm_write_status = first_pass.bpm_write_status
+    result.original_gap_ms = (
+        first_pass.original_gap_ms
+        if first_pass.original_gap_ms is not None
+        else first_pass.old_gap_ms
+    )
+    result.current_gap_ms = (
+        result.old_gap_ms
+        if result.old_gap_ms is not None
+        else first_pass.current_gap_ms
+    )
+    result.original_bpm = (
+        first_pass.original_bpm
+        if first_pass.original_bpm is not None
+        else first_pass.bpm
+    )
+    result.current_bpm = result.bpm if result.bpm is not None else first_pass.current_bpm
     result.bpm_sample_notes.append(
         "Second analysis pass ran after the #BPM update to recalculate GAP "
         "and verify BPM; no second BPM update was attempted."
@@ -2718,6 +2801,10 @@ def reanalyze_after_bpm_update(
 
 def write_first_pass_chart_updates(result: Analysis, args: argparse.Namespace) -> bool:
     """Write eligible first-pass values and report whether BPM changed."""
+    if result.original_gap_ms is None:
+        result.original_gap_ms = result.old_gap_ms
+    if result.current_gap_ms is None:
+        result.current_gap_ms = result.old_gap_ms
     if args.write_bpm:
         result.bpm_write_status = write_bpm_update(
             result,
@@ -2733,17 +2820,19 @@ def write_first_pass_chart_updates(result: Analysis, args: argparse.Namespace) -
     return False
 
 
-def format_ms(value: Optional[float]) -> str:
+def format_ms(value: float | None) -> str:
+    """Format a millisecond value or indicate that it was not assessed."""
     if value is None:
         return "Not assessed"
     return f"{value:.0f} ms"
 
 
 def format_bpm_change(
-    current_bpm: Optional[float],
-    correction: Optional[float],
+    current_bpm: float | None,
+    correction: float | None,
     diagnostic_only: bool = False,
-) -> Optional[str]:
+) -> str | None:
+    """Describe the percentage and direction of a valid BPM correction."""
     if (
         current_bpm is None
         or correction is None
@@ -2765,11 +2854,23 @@ def format_bpm_change(
     return f"{label}: {change_percent:+.2f}% ({direction})"
 
 
+def bpm_report_baseline_and_correction(
+    result: Analysis,
+) -> tuple[float | None, float | None]:
+    """Return BPM report values relative to the original BPM after an update."""
+    baseline = result.original_bpm if result.original_bpm is not None else result.bpm
+    correction = result.bpm_correction
+    if result.original_bpm is not None and result.suggested_bpm is not None:
+        correction = result.suggested_bpm - result.original_bpm
+    return baseline, correction
+
+
 def format_summary_report(
     results: list[Analysis],
     args: argparse.Namespace,
     include_header: bool = True,
 ) -> str:
+    """Format a concise report for one or more chart analyses."""
     lines = []
 
     if include_header:
@@ -2799,6 +2900,27 @@ def format_summary_report(
         ])
 
     for result in results:
+        bpm_baseline, bpm_correction = bpm_report_baseline_and_correction(result)
+        original_gap = (
+            result.original_gap_ms
+            if result.original_gap_ms is not None
+            else result.old_gap_ms
+        )
+        current_gap = (
+            result.current_gap_ms
+            if result.current_gap_ms is not None
+            else result.old_gap_ms
+        )
+        original_bpm = (
+            result.original_bpm
+            if result.original_bpm is not None
+            else result.bpm
+        )
+        current_bpm = (
+            result.current_bpm
+            if result.current_bpm is not None
+            else result.bpm
+        )
         audio_window = (
             result.audio_opening_seconds
             if result.audio_opening_seconds is not None
@@ -2817,8 +2939,20 @@ def format_summary_report(
             f"Status: {result.status}",
             f"Audio opening window used: {audio_window:.1f} seconds",
             f"Chart opening window used: {chart_window:.1f} seconds",
-            f"Current #GAP: {format_ms(result.old_gap_ms)}",
-            f"Current #BPM: {result.bpm:.1f}" if result.bpm is not None else "Current #BPM: Unknown",
+        ])
+        lines.extend([
+            f"Original #GAP: {format_ms(original_gap)}",
+            f"Current #GAP: {format_ms(current_gap)}",
+            (
+                f"Original #BPM: {original_bpm:.1f}"
+                if original_bpm is not None
+                else "Original #BPM: Unknown"
+            ),
+            (
+                f"Current #BPM: {current_bpm:.1f}"
+                if current_bpm is not None
+                else "Current #BPM: Unknown"
+            ),
         ])
 
         if (
@@ -2855,12 +2989,12 @@ def format_summary_report(
             ):
                 lines.extend([
                     f"Suggested #BPM: {result.suggested_bpm:.3f}",
-                    f"BPM correction: {result.bpm_correction:+.3f}",
+                    f"BPM correction: {bpm_correction:+.3f}",
                     f"BPM confidence: {result.bpm_confidence}",
                 ])
                 bpm_change = format_bpm_change(
-                    result.bpm,
-                    result.bpm_correction,
+                    bpm_baseline,
+                    bpm_correction,
                 )
                 if bpm_change:
                     lines.append(bpm_change)
@@ -2868,9 +3002,9 @@ def format_summary_report(
                 lines.extend([
                     "Suggested #BPM: Withheld",
                     (
-                        f"BPM correction: {result.bpm_correction:+.3f} "
+                        f"BPM correction: {bpm_correction:+.3f} "
                         "(diagnostic only)"
-                        if result.bpm_correction is not None
+                        if bpm_correction is not None
                         else "BPM correction: Not assessed"
                     ),
                     f"BPM confidence: {result.bpm_confidence}",
@@ -2881,8 +3015,8 @@ def format_summary_report(
                         f"{result.bpm_write_block_reason}."
                     )
                 bpm_change = format_bpm_change(
-                    result.bpm,
-                    result.bpm_correction,
+                    bpm_baseline,
+                    bpm_correction,
                     diagnostic_only=True,
                 )
                 if bpm_change:
@@ -2904,6 +3038,7 @@ def format_report(
     args: argparse.Namespace,
     include_header: bool = True,
 ) -> str:
+    """Format chart analyses at the requested report detail level."""
     if args.report_level == "summary":
         return format_summary_report(results, args, include_header)
 
@@ -2949,6 +3084,27 @@ def format_report(
         ])
 
     for result in results:
+        bpm_baseline, bpm_correction = bpm_report_baseline_and_correction(result)
+        original_gap = (
+            result.original_gap_ms
+            if result.original_gap_ms is not None
+            else result.old_gap_ms
+        )
+        current_gap = (
+            result.current_gap_ms
+            if result.current_gap_ms is not None
+            else result.old_gap_ms
+        )
+        original_bpm = (
+            result.original_bpm
+            if result.original_bpm is not None
+            else result.bpm
+        )
+        current_bpm = (
+            result.current_bpm
+            if result.current_bpm is not None
+            else result.bpm
+        )
         audio_window = (
             result.audio_opening_seconds
             if result.audio_opening_seconds is not None
@@ -2967,8 +3123,20 @@ def format_report(
             f"Status: {result.status}",
             f"Audio opening window used: {audio_window:.1f} seconds",
             f"Chart opening window used: {chart_window:.1f} seconds",
-            f"Current #GAP: {format_ms(result.old_gap_ms)}",
-            f"Current #BPM: {result.bpm if result.bpm is not None else 'Unknown'}",
+        ])
+        lines.extend([
+            f"Original #GAP: {format_ms(original_gap)}",
+            f"Current #GAP: {format_ms(current_gap)}",
+            (
+                f"Original #BPM: {original_bpm:g}"
+                if original_bpm is not None
+                else "Original #BPM: Unknown"
+            ),
+            (
+                f"Current #BPM: {current_bpm:g}"
+                if current_bpm is not None
+                else "Current #BPM: Unknown"
+            ),
         ])
 
         # Keep the recommendation near the current settings, before diagnostic details.
@@ -2984,10 +3152,14 @@ def format_report(
         else:
             lines.extend([
                 "Suggested #GAP: WITHHELD because the evidence is insufficient.",
-                f"Estimated GAP (diagnostic only): "
-                f"{format_ms(result.suggested_gap_ms)}",
-                f"Estimated correction (diagnostic only): "
-                f"{format_ms(result.correction_ms)}",
+                (
+                    f"Estimated GAP (diagnostic only): "
+                    f"{format_ms(result.suggested_gap_ms)}"
+                ),
+                (
+                    f"Estimated correction (diagnostic only): "
+                    f"{format_ms(result.correction_ms)}"
+                ),
             ])
 
         lines.extend([
@@ -3010,20 +3182,20 @@ def format_report(
         ):
             lines.extend([
                 f"Suggested #BPM: {result.suggested_bpm:.3f}",
-                f"BPM correction: {result.bpm_correction:+.3f}",
+                f"BPM correction: {bpm_correction:+.3f}",
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason}",
             ])
             bpm_change = format_bpm_change(
-                result.bpm,
-                result.bpm_correction,
+                bpm_baseline,
+                bpm_correction,
             )
             if bpm_change:
                 lines.append(bpm_change)
         elif result.suggested_bpm is not None:
             lines.extend([
                 f"Estimated #BPM (diagnostic only): {result.suggested_bpm:.3f}",
-                f"BPM correction (diagnostic only): {result.bpm_correction:+.3f}",
+                f"BPM correction (diagnostic only): {bpm_correction:+.3f}",
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason}",
             ])
@@ -3033,8 +3205,8 @@ def format_report(
                     f"{result.bpm_write_block_reason}."
                 )
             bpm_change = format_bpm_change(
-                result.bpm,
-                result.bpm_correction,
+                bpm_baseline,
+                bpm_correction,
                 diagnostic_only=True,
             )
             if bpm_change:
@@ -3044,16 +3216,16 @@ def format_report(
                 "Suggested #BPM: WITHHELD because the evidence is insufficient.",
                 (
                     f"BPM correction (diagnostic only): "
-                    f"{result.bpm_correction:+.3f}"
-                    if result.bpm_correction is not None
+                    f"{bpm_correction:+.3f}"
+                    if bpm_correction is not None
                     else "BPM correction: Not assessed"
                 ),
                 f"BPM confidence: {result.bpm_confidence}",
                 f"BPM assessment: {result.bpm_reason or 'Not assessed'}",
             ])
             bpm_change = format_bpm_change(
-                result.bpm,
-                result.bpm_correction,
+                bpm_baseline,
+                bpm_correction,
                 diagnostic_only=True,
             )
             if bpm_change:
@@ -3081,8 +3253,10 @@ def format_report(
             lines.extend([
                 "",
                 "Ordered lyric matches:",
-                "Chart word | Audio word | Similarity | Chart time | "
-                "Audio time | GAP estimate",
+                (
+                    "Chart word | Audio word | Similarity | Chart time | "
+                    "Audio time | GAP estimate"
+                ),
             ])
 
             for match in result.matches:
@@ -3121,8 +3295,10 @@ def format_report(
             ]
             if later_sample_diagnostics:
                 lines.extend([
-                    "Beginning BPM sample reuses the opening GAP transcription "
-                    "and matches shown below.",
+                    (
+                        "Beginning BPM sample reuses the opening GAP transcription "
+                        "and matches shown below."
+                    ),
                     "Later BPM sample transcription and matching details:",
                 ])
                 for diagnostic in later_sample_diagnostics:
@@ -3151,8 +3327,10 @@ def format_report(
                     if diagnostic.matches:
                         lines.extend([
                             "Matched chart/Whisper words:",
-                            "Chart word | Whisper word | Similarity | "
-                            "Chart time | Audio time | Offset",
+                            (
+                                "Chart word | Whisper word | Similarity | "
+                                "Chart time | Audio time | Offset"
+                            ),
                         ])
                         for match in diagnostic.matches:
                             lines.append(
@@ -3183,8 +3361,10 @@ def format_report(
             and result.confidence in {"High", "Medium"}
         ):
             lines.extend([
-                "Decision: provisional suggestion; review the matches before "
-                "changing the chart.",
+                (
+                    "Decision: provisional suggestion; review the matches before "
+                    "changing the chart."
+                ),
             ])
 
         lines.append("")
@@ -3193,6 +3373,7 @@ def format_report(
 
 
 def format_review_report_entry(result: Analysis) -> str:
+    """Format a review entry for a large GAP correction or drift warning."""
     eligible_gap = (
         result.audio_path is not None
         and result.suggested_gap_ms is not None
@@ -3216,6 +3397,7 @@ def format_review_report_entry(result: Analysis) -> str:
 
 
 def resolve_source_directories(source: Path) -> list[Path]:
+    """Resolve a source directory or list file into unique, non-overlapping paths."""
     source = source.expanduser().resolve()
     if source.is_dir():
         return [source]
@@ -3269,6 +3451,7 @@ def find_chart_paths(
     source_directories: list[Path],
     excluded_paths: set[Path],
 ) -> list[Path]:
+    """Find unique chart files under source directories, excluding output paths."""
     charts_by_resolved_path: dict[Path, Path] = {}
     for directory in source_directories:
         for chart_path in directory.rglob("*.txt"):
@@ -3282,6 +3465,7 @@ def find_chart_paths(
 
 
 def main() -> int:
+    """Parse command-line options, analyze charts, and write reports."""
     parser = argparse.ArgumentParser(
         description=(
             "Estimate UltraStar #GAP values and verify #BPM using sampled "
@@ -3478,111 +3662,114 @@ def main() -> int:
 
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        with report_path.open("w", encoding="utf-8") as report_file:
-            with review_report_path.open("w", encoding="utf-8") as review_report_file:
-                report_file.write(format_report([], args))
-                review_report_file.write(
-                    "Songs with recommended GAP corrections of at least 1,000 ms "
-                    "or a possible opening timing-drift warning\n\n"
+        with (
+            report_path.open("w", encoding="utf-8") as report_file,
+            review_report_path.open("w", encoding="utf-8") as review_report_file,
+        ):
+            report_file.write(format_report([], args))
+            review_report_file.write(
+                "Songs with recommended GAP corrections of at least 1,000 ms "
+                "or a possible opening timing-drift warning\n\n"
+            )
+            song_durations: list[float] = []
+
+            def append_result(result: Analysis) -> None:
+                """Append a completed chart to both reports and flush them."""
+                report_file.write(
+                    format_report([result], args, include_header=False)
                 )
-                song_durations: list[float] = []
+                review_report_file.write(format_review_report_entry(result))
+                report_file.flush()
+                review_report_file.flush()
 
-                def append_result(result: Analysis) -> None:
-                    report_file.write(
-                        format_report([result], args, include_header=False)
+            if args.device == "both":
+                both_started_at = time.monotonic()
+                pending_bpm_reanalysis: list[Analysis] = []
+                for index, (_, output) in enumerate(
+                    analyze_charts_on_both_devices(chart_paths, args),
+                    start=1,
+                ):
+                    if output.logs:
+                        print(output.logs, end="", flush=True)
+                        if not output.logs.endswith("\n"):
+                            print(flush=True)
+                    if write_first_pass_chart_updates(output.analysis, args):
+                        pending_bpm_reanalysis.append(output.analysis)
+                    else:
+                        append_result(output.analysis)
+                    estimated_end = estimate_parallel_completion_time(
+                        time.monotonic() - both_started_at,
+                        index,
+                        len(chart_paths),
                     )
-                    review_report_file.write(format_review_report_entry(result))
-                    report_file.flush()
-                    review_report_file.flush()
-
-                if args.device == "both":
-                    both_started_at = time.monotonic()
-                    pending_bpm_reanalysis: list[Analysis] = []
-                    for index, (_, output) in enumerate(
-                        analyze_charts_on_both_devices(chart_paths, args),
-                        start=1,
-                    ):
-                        if output.logs:
-                            print(output.logs, end="", flush=True)
-                            if not output.logs.endswith("\n"):
-                                print(flush=True)
-                        if write_first_pass_chart_updates(output.analysis, args):
-                            pending_bpm_reanalysis.append(output.analysis)
-                        else:
-                            append_result(output.analysis)
-                        estimated_end = estimate_parallel_completion_time(
-                            time.monotonic() - both_started_at,
-                            index,
-                            len(chart_paths),
+                    end_text = (
+                        format_estimated_end(estimated_end)
+                        if estimated_end is not None
+                        else "calculating"
+                    )
+                    print(
+                        f"[{index}/{len(chart_paths)} completed; "
+                        f"Estimated End {end_text}] "
+                        f"{output.analysis.chart_path}: "
+                        f"{output.analysis.status}: "
+                        f"{output.analysis.confidence}",
+                        flush=True,
+                    )
+                for reanalysis_index, first_pass in enumerate(
+                    pending_bpm_reanalysis,
+                    start=1,
+                ):
+                    print(
+                        f"[BPM update reanalysis "
+                        f"{reanalysis_index}/{len(pending_bpm_reanalysis)}] "
+                        f"Analyzing: {first_pass.chart_path}",
+                        flush=True,
+                    )
+                    result = reanalyze_after_bpm_update(first_pass, args)
+                    append_result(result)
+                    print(
+                        f"    Second-pass {result.status}: "
+                        f"{result.confidence}",
+                        flush=True,
+                    )
+            else:
+                for index, chart_path in enumerate(chart_paths, start=1):
+                    estimated_end = estimate_completion_time(
+                        song_durations,
+                        len(chart_paths) - index + 1,
+                    )
+                    end_text = (
+                        format_estimated_end(estimated_end)
+                        if estimated_end is not None
+                        else "calculating"
+                    )
+                    print(
+                        f"[{index}/{len(chart_paths)} Estimated End {end_text}] "
+                        f"Analyzing: {chart_path}"
+                    )
+                    song_started_at = time.monotonic()
+                    try:
+                        result = analyze_chart_with_cpu_fallback(
+                            chart_path,
+                            args,
                         )
-                        end_text = (
-                            format_estimated_end(estimated_end)
-                            if estimated_end is not None
-                            else "calculating"
+                    except Exception as exc:
+                        result = Analysis(
+                            chart_path=chart_path,
+                            audio_path=find_audio_for_chart(chart_path),
+                            old_gap_ms=None,
+                            bpm=None,
+                            status="Analysis failed",
+                            reason=f"{type(exc).__name__}: {exc}",
                         )
-                        print(
-                            f"[{index}/{len(chart_paths)} completed; "
-                            f"Estimated End {end_text}] "
-                            f"{output.analysis.chart_path}: "
-                            f"{output.analysis.status}: "
-                            f"{output.analysis.confidence}",
-                            flush=True,
-                        )
-                    for reanalysis_index, first_pass in enumerate(
-                        pending_bpm_reanalysis,
-                        start=1,
-                    ):
-                        print(
-                            f"[BPM update reanalysis "
-                            f"{reanalysis_index}/{len(pending_bpm_reanalysis)}] "
-                            f"Analyzing: {first_pass.chart_path}",
-                            flush=True,
-                        )
-                        result = reanalyze_after_bpm_update(first_pass, args)
-                        append_result(result)
-                        print(
-                            f"    Second-pass {result.status}: "
-                            f"{result.confidence}",
-                            flush=True,
-                        )
-                else:
-                    for index, chart_path in enumerate(chart_paths, start=1):
-                        estimated_end = estimate_completion_time(
-                            song_durations,
-                            len(chart_paths) - index + 1,
-                        )
-                        end_text = (
-                            format_estimated_end(estimated_end)
-                            if estimated_end is not None
-                            else "calculating"
-                        )
-                        print(
-                            f"[{index}/{len(chart_paths)} Estimated End {end_text}] "
-                            f"Analyzing: {chart_path}"
-                        )
-                        song_started_at = time.monotonic()
-                        try:
-                            result = analyze_chart_with_cpu_fallback(
-                                chart_path,
-                                args,
-                            )
-                        except Exception as exc:
-                            result = Analysis(
-                                chart_path=chart_path,
-                                audio_path=find_audio_for_chart(chart_path),
-                                old_gap_ms=None,
-                                bpm=None,
-                                status="Analysis failed",
-                                reason=f"{type(exc).__name__}: {exc}",
-                            )
-                            if args.debug:
-                                result.reason += "\n" + traceback.format_exc()
-                        if write_first_pass_chart_updates(result, args):
-                            result = reanalyze_after_bpm_update(result, args)
-                        append_result(result)
-                        song_durations.append(time.monotonic() - song_started_at)
-                        print(f"    {result.status}: {result.confidence}")
-                        del result
+                        if args.debug:
+                            result.reason += "\n" + traceback.format_exc()
+                    if write_first_pass_chart_updates(result, args):
+                        result = reanalyze_after_bpm_update(result, args)
+                    append_result(result)
+                    song_durations.append(time.monotonic() - song_started_at)
+                    print(f"    {result.status}: {result.confidence}")
+                    del result
     except OSError as exc:
         print(f"Could not write report(s): {exc}", file=sys.stderr)
         return 2

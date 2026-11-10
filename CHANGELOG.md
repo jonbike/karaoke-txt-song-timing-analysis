@@ -2,6 +2,12 @@
 
 Notable user-facing changes are listed here, grouped by project version.
 
+## 0.3.3
+
+- Lower the minimum BPM write threshold from 0.50% to 0.35%.
+- Report original and current GAP/BPM values together, and calculate BPM
+  correction and percentage change against the original BPM after reanalysis.
+
 ## 0.3.2
 
 - Add `--allow-small-updates` to permit below-threshold GAP and BPM writes

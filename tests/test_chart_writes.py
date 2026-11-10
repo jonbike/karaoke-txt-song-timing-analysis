@@ -279,6 +279,10 @@ class ChartWriteTests(unittest.TestCase):
                 result = analysis.reanalyze_after_bpm_update(first_pass, args)
 
             self.assertEqual(result, second_pass)
+            self.assertEqual(result.original_bpm, 120)
+            self.assertEqual(result.original_gap_ms, 100)
+            self.assertEqual(result.current_gap_ms, 250)
+            self.assertEqual(result.current_bpm, 120.6)
             self.assertIn("Updated #BPM from 120 to 120.600", result.bpm_write_status)
             self.assertIn("Updated #GAP from 100 ms to 250 ms", result.gap_write_status)
             self.assertEqual(
@@ -353,7 +357,7 @@ class ChartWriteTests(unittest.TestCase):
             )
 
             self.assertFalse(bpm_was_updated)
-            self.assertIn("below the 0.50% write threshold", result.bpm_write_status)
+            self.assertIn("below the 0.35% write threshold", result.bpm_write_status)
             self.assertIn("Updated #GAP", result.gap_write_status)
             self.assertEqual(
                 chart_path.read_bytes(),
@@ -392,14 +396,14 @@ class ChartWriteTests(unittest.TestCase):
                 old_gap_ms=None,
                 bpm=120,
                 status="Analyzed",
-                suggested_bpm=120.599,
+                suggested_bpm=120.419,
                 bpm_confidence="Medium",
             )
 
             status = analysis.write_bpm_update(result)
 
-            self.assertIn("proposed #BPM change is 0.499%", status)
-            self.assertIn("below the 0.50% write threshold", status)
+            self.assertIn("proposed #BPM change is 0.349%", status)
+            self.assertIn("below the 0.35% write threshold", status)
             self.assertEqual(chart_path.read_bytes(), original)
             self.assertFalse(chart_path.with_suffix(".bak").exists())
 
@@ -469,7 +473,7 @@ class ChartWriteTests(unittest.TestCase):
 
             self.assertIn("Updated #BPM from 120 to 120.300", status)
             self.assertIn(
-                "below the normal 0.50% threshold; written because "
+                "below the normal 0.35% threshold; written because "
                 "--allow-small-updates was supplied",
                 status,
             )
@@ -511,16 +515,16 @@ class ChartWriteTests(unittest.TestCase):
                 old_gap_ms=None,
                 bpm=120,
                 status="Analyzed",
-                suggested_bpm=120.6,
+                suggested_bpm=120.42,
                 bpm_confidence="Medium",
             )
 
             status = analysis.write_bpm_update(result)
 
-            self.assertIn("Updated #BPM from 120 to 120.600", status)
+            self.assertIn("Updated #BPM from 120 to 120.420", status)
             self.assertEqual(
                 chart_path.read_bytes(),
-                b"#TITLE:Song\n#BPM: 120.600\n",
+                b"#TITLE:Song\n#BPM: 120.420\n",
             )
 
     def test_summary_report_includes_bpm_suggestion_and_write_status(self) -> None:
@@ -549,7 +553,7 @@ class ChartWriteTests(unittest.TestCase):
             write_bpm=True,
         )
 
-        report = analysis.format_summary_report([result], args)
+        report = analysis.format_summary_report([result], args        )
 
         self.assertIn("WhisperX batch size: 4", report)
         self.assertIn("Suggested #BPM: 333.152", report)
@@ -600,6 +604,44 @@ class ChartWriteTests(unittest.TestCase):
             "BPM update: Withheld because GAP confidence is Low.",
             gap_blocked_report,
         )
+
+    def test_reports_distinguish_original_and_updated_bpm(self) -> None:
+        result = analysis.Analysis(
+            chart_path=Path("/charts/song.txt"),
+            audio_path=Path("/audio/song.mp3"),
+            old_gap_ms=100,
+            bpm=255,
+            status="Analysis complete",
+            original_gap_ms=100,
+            current_gap_ms=250,
+            original_bpm=256,
+            suggested_bpm=255.007,
+            bpm_correction=0.007,
+            bpm_confidence="High",
+        )
+        args = analysis.argparse.Namespace(
+            report_level="summary",
+            match_threshold=0.55,
+            batch_size=4,
+            audio_opening_seconds=60,
+            chart_opening_seconds=60,
+            bpm=True,
+            write_gap=False,
+            write_bpm=False,
+        )
+
+        summary = analysis.format_summary_report([result], args)
+        detailed_args = analysis.argparse.Namespace(**vars(args))
+        detailed_args.report_level = "all"
+        detailed = analysis.format_report([result], detailed_args)
+
+        for report in (summary, detailed):
+            self.assertIn("Original #GAP: 100 ms\nCurrent #GAP: 250 ms", report)
+            self.assertIn("Original #BPM: 256", report)
+            self.assertIn("Current #BPM: 255", report)
+            self.assertIn("Suggested #BPM: 255.007", report)
+            self.assertIn("BPM correction: -0.993", report)
+            self.assertIn("BPM change: -0.39% (decrease chart tempo)", report)
 
     def test_bpm_change_format_uses_signed_percent_and_chart_direction(self) -> None:
         self.assertEqual(

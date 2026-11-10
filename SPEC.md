@@ -236,9 +236,11 @@ outcomes clear.
 4. The review report includes eligible Medium/High GAP suggestions whose
    absolute correction is at least 1000 ms, and every chart that triggers the
    opening timing-drift warning, regardless of GAP suggestion eligibility.
-5. Include current and suggested values, confidence, reasons, BPM sample
-   details when enabled (including the signed percentage BPM change), and the
-   result of each requested chart write.
+5. Include original and current GAP and BPM values as adjacent pairs, with the
+   original value first. Current values must reflect successful chart writes;
+   when no value is written, current equals original. Include suggested values,
+   confidence, reasons, BPM sample details when enabled (including the signed
+   percentage BPM change), and the result of each requested chart write.
    The main report header must include the complete effective command line.
    When `--allow-small-updates` is supplied, state that the normal GAP/BPM size
    thresholds are bypassed while other safeguards remain active. If a
@@ -281,7 +283,7 @@ outcomes clear.
    changed since analysis.
 3. `--write-bpm` requires `--bpm`. It may update only a finite positive
    BPM suggestion with Medium or High BPM confidence when its rounded change
-   is at least 0.5% of the current BPM, unless `--allow-small-updates` is
+   is at least 0.35% of the current BPM, unless `--allow-small-updates` is
    supplied. Round to three decimal places before evaluating the percentage
    and writing. This option bypasses only the GAP and BPM size thresholds; it
    does not bypass confidence, value, stale-chart, or other write safeguards,

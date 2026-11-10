@@ -177,11 +177,31 @@ and transcription, increasing `--match-threshold` or trying a larger WhisperX
 model may improve results. A higher threshold is stricter and may reject some
 valid matches, while larger models require more compute and memory.
 
+## BPM differences and timing drift
+
+A small BPM difference can accumulate into a noticeable timing offset over a
+song. For example, changing a four-minute song from 256 BPM to 255 BPM is a
+difference of about 0.39% relative to 256 BPM. Assuming the song starts aligned
+and both tempos stay constant, that one-BPM decrease can put the chart about
+0.82 seconds out of sync by 3:30 and about 0.94 seconds out of sync by 4:00.
+The words may therefore feel increasingly early or late even though the BPM
+values differ by only one.
+
+The default BPM write threshold is 0.35% of the current chart BPM, evaluated
+after rounding the suggestion to the three decimal places written to the chart.
+At 256 BPM, a one-BPM change is about 0.39%, so it passes the size threshold;
+confidence and the other write safeguards must still pass. This threshold is a
+minimum write size, not a guarantee that a suggested tempo is correct. Listen
+to the song and review its analysis before accepting a BPM change, especially
+for songs whose tempo varies.
+
 The report is created or overwritten at the path given by `--report`. It
-includes each chart's current and suggested `#GAP`, match confidence, analysis
-details, and any reason a suggestion was withheld or a chart could not be
-analyzed. A companion report with `_review` appended to the filename is also
-created or overwritten (for example, `gap_report.txt` produces
+includes each chart's original and current `#GAP` and `#BPM` values as adjacent
+pairs, followed by suggestions, confidence, analysis details, and any reason a
+suggestion was withheld or a chart could not be analyzed. If no update is
+written, the current value matches the original; successful updates show the
+new chart value as current. A companion report with `_review` appended to the
+filename is also created or overwritten (for example, `gap_report.txt` produces
 `gap_report_review.txt`). It lists eligible Medium/High GAP suggestions whose
 absolute correction is at least 1,000 ms, and also includes every song that
 triggers the opening timing-drift warning described below. Both reports are
@@ -221,7 +241,7 @@ enable chart updates for a larger run.
   depends on how many songs need review and how much time you can spend.
 
 By default, the tool skips GAP changes smaller than 100 ms and BPM changes
-smaller than 0.5%. These thresholds help with large catalogues by avoiding
+smaller than 0.35%. These thresholds help with large catalogues by avoiding
 chart edits for small adjustments, making it easier to see which song files
 were meaningfully changed. To write smaller changes, add
 `--allow-small-updates` alongside `--write-gap` and/or `--write-bpm`.
@@ -325,7 +345,7 @@ Without `--write-gap` or `--write-bpm`, chart and audio files are read only.
 confidence, is finite, and differs from the current value by at least 100 ms.
 `--write-bpm` requires `--bpm` and updates only finite, positive BPM
 suggestions with Medium or High confidence, and only when the proposed change
-is at least 0.5% of the current BPM. The threshold is evaluated after rounding
+is at least 0.35% of the current BPM. The threshold is evaluated after rounding
 the suggestion to the three decimal places written to the chart; smaller
 changes remain visible in the report but are not written. Add
 `--allow-small-updates` to bypass only these GAP and BPM size thresholds. The
@@ -336,10 +356,12 @@ If a BPM change is written, the tool first updates only `#BPM`, then reanalyzes
 the chart using that new tempo and uses the second pass to verify BPM and
 calculate the GAP to write. It never writes the stale first-pass GAP alongside
 a BPM change, and does not apply a second BPM correction automatically. The
-original chart backup is retained through both writes. If the BPM is not
-changed, the first-pass GAP can be written normally. When only GAP is eligible,
-it is written from the first pass. If the second analysis fails, the BPM update
-remains, but GAP is not written; the report identifies the failed reanalysis.
+original chart backup is retained through both writes. Reports show original
+and current GAP and BPM values as adjacent pairs, including after a BPM update.
+If the BPM is not changed, the first-pass GAP can be written normally. When
+only GAP is eligible, it is written from the first pass. If the second analysis
+fails, the BPM update remains, but GAP is not written; the report identifies
+the failed reanalysis.
 Before changing a chart, the tool refreshes a sibling backup named
 `<chart-stem>.bak` (for example, `song.bak` for `song.txt`). If that backup
 already exists, it is moved into a `backups/` subdirectory before the latest
