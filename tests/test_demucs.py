@@ -516,7 +516,7 @@ class CpuFallbackTests(unittest.TestCase):
         self.assertEqual(self.args.device, "cuda")
         self.assertEqual(self.args.compute_type, "float16")
 
-    def test_does_not_retry_non_oom_failures(self) -> None:
+    def test_does_not_retry_non_cuda_failures(self) -> None:
         failure = self.make_result("Analysis failed", "WhisperX model not found.")
 
         with patch.object(
@@ -532,7 +532,78 @@ class CpuFallbackTests(unittest.TestCase):
         self.assertIs(result, failure)
         analyze.assert_called_once_with(self.chart_path, self.args)
 
-    def test_reports_gpu_and_cpu_errors_when_cpu_retry_fails(self) -> None:
+    def test_retries_non_memory_cuda_errors_on_cpu(self) -> None:
+        cuda_failure = self.make_result(
+            "Analysis failed",
+            "RuntimeError: CUDA error: device-side assert triggered.",
+        )
+        cpu_success = self.make_result("Analysis complete", "GAP estimated.")
+
+        with patch.object(
+            analysis,
+            "analyze_chart_in_child_process",
+            side_effect=(cuda_failure, cpu_success),
+        ) as analyze:
+            result = analysis.analyze_chart_with_cpu_fallback(
+                self.chart_path,
+                self.args,
+            )
+
+        self.assertIs(result, cpu_success)
+        self.assertIn("CUDA/GPU attempt failed", result.reason)
+        self.assertIn("succeeded on CPU retry", result.reason)
+        self.assertEqual(analyze.call_count, 2)
+        self.assertEqual(analyze.call_args_list[1].args[1].device, "cpu")
+
+    def test_retries_whisper_batch_size_memory_error_on_cpu(self) -> None:
+        gpu_failure = self.make_result(
+            "Analysis failed",
+            "MemoryError: batch_size ( 32) is probably too large. "
+            "Try with a smaller value until memory error disappears.",
+        )
+        cpu_success = self.make_result("Analysis complete", "GAP estimated.")
+
+        with patch.object(
+            analysis,
+            "analyze_chart_in_child_process",
+            side_effect=(gpu_failure, cpu_success),
+        ) as analyze:
+            result = analysis.analyze_chart_with_cpu_fallback(
+                self.chart_path,
+                self.args,
+            )
+
+        self.assertIs(result, cpu_success)
+        self.assertIn("succeeded on CPU retry", result.reason)
+        self.assertEqual(analyze.call_count, 2)
+        self.assertEqual(analyze.call_args_list[1].args[1].device, "cpu")
+        self.assertEqual(analyze.call_args_list[1].args[1].compute_type, "int8")
+
+    def test_retries_cuda_oom_reported_by_bpm_sample_on_cpu(self) -> None:
+        gpu_result = self.make_result("Analysis complete", "GAP estimated.")
+        gpu_result.bpm_sample_notes.append(
+            "Later BPM sample transcription failed: "
+            "OutOfMemoryError: CUDA out of memory."
+        )
+        cpu_result = self.make_result("Analysis complete", "GAP estimated.")
+
+        with patch.object(
+            analysis,
+            "analyze_chart_in_child_process",
+            side_effect=(gpu_result, cpu_result),
+        ) as analyze:
+            result = analysis.analyze_chart_with_cpu_fallback(
+                self.chart_path,
+                self.args,
+            )
+
+        self.assertIs(result, cpu_result)
+        self.assertIn("succeeded on CPU retry", result.reason)
+        self.assertEqual(analyze.call_count, 2)
+        self.assertEqual(analyze.call_args_list[1].args[1].device, "cpu")
+        self.assertEqual(analyze.call_args_list[1].args[1].compute_type, "int8")
+
+    def test_reports_cuda_and_cpu_errors_when_cpu_retry_fails(self) -> None:
         gpu_failure = self.make_result(
             "Analysis failed",
             "CUDA out of memory.",
@@ -551,7 +622,7 @@ class CpuFallbackTests(unittest.TestCase):
                 self.args,
             )
 
-        self.assertIn("GPU error: CUDA out of memory.", result.reason)
+        self.assertIn("CUDA/GPU error: CUDA out of memory.", result.reason)
         self.assertIn("CPU error: CPU transcription failed.", result.reason)
 
 

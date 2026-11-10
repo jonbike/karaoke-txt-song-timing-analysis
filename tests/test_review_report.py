@@ -54,9 +54,28 @@ class ReviewReportTests(unittest.TestCase):
 
         self.assertEqual(
             analysis.format_review_report_entry(result),
+            "Chart: /charts/song.txt\n"
             "Audio: /audio/song.mp3\n"
             "GAP Correction: +1000 ms\n"
             "Confidence: High\n\n",
+        )
+
+    def test_entry_includes_failed_analysis_details(self) -> None:
+        result = analysis.Analysis(
+            chart_path=Path("/charts/failed_song.txt"),
+            audio_path=None,
+            old_gap_ms=100,
+            bpm=120,
+            status="Analysis failed",
+            reason="RuntimeError: CUDA kernel failed.\nRun again with --debug.",
+        )
+
+        self.assertEqual(
+            analysis.format_review_report_entry(result),
+            "Chart: /charts/failed_song.txt\n"
+            "Audio: Not found\n"
+            "Analysis failed\n"
+            "Reason: RuntimeError: CUDA kernel failed.\n\n",
         )
 
     def test_entry_excludes_small_and_ineligible_corrections(self) -> None:
@@ -94,7 +113,7 @@ class ReviewReportTests(unittest.TestCase):
             root = Path(temporary_directory)
             source = root / "songs"
             source.mkdir()
-            charts = [source / f"song_{index}.txt" for index in range(3)]
+            charts = [source / f"song_{index}.txt" for index in range(4)]
             for chart in charts:
                 chart.write_text("#TITLE:Test\n", encoding="utf-8")
             report_path = root / "gap_report_english.txt"
@@ -132,6 +151,14 @@ class ReviewReportTests(unittest.TestCase):
                         "Opening match offsets show a sustained -2,750 ms trend."
                     ),
                 ),
+                analysis.Analysis(
+                    chart_path=charts[3],
+                    audio_path=None,
+                    old_gap_ms=None,
+                    bpm=None,
+                    status="Analysis failed",
+                    reason="RuntimeError: CUDA kernel failed.",
+                ),
             ]
 
             output = io.StringIO()
@@ -157,12 +184,12 @@ class ReviewReportTests(unittest.TestCase):
 
             console_output = output.getvalue()
             self.assertIn(
-                "[1/3 Estimated End calculating] Analyzing:",
+                "[1/4 Estimated End calculating] Analyzing:",
                 console_output,
             )
             self.assertRegex(
                 console_output,
-                r"\[2/3 Estimated End \d{2}:\d{2}\] Analyzing:",
+                r"\[2/4 Estimated End \d{2}:\d{2}\] Analyzing:",
             )
 
             review_path = root / "gap_report_english_review.txt"
@@ -174,6 +201,9 @@ class ReviewReportTests(unittest.TestCase):
             self.assertNotIn("song_1.mp3", review)
             self.assertIn("Audio: /audio/song_2.mp3", review)
             self.assertIn("sustained -2,750 ms trend", review)
+            self.assertIn(f"Chart: {charts[3]}", review)
+            self.assertIn("Analysis failed", review)
+            self.assertIn("Reason: RuntimeError: CUDA kernel failed.", review)
             self.assertIn(
                 "BPM verification: Disabled (pass --bpm to enable).",
                 report_text,

@@ -2103,16 +2103,29 @@ def terminate_active_chart_processes() -> None:
                 process.terminate()
 
 
-def is_cuda_out_of_memory(reason: str) -> bool:
-    """Return whether a failure reason explicitly reports CUDA OOM."""
+def is_cuda_failure(reason: str) -> bool:
+    """Return whether a failure reason identifies a CUDA/GPU runtime issue."""
     normalized_reason = reason.casefold()
     return (
-        "cuda out of memory" in normalized_reason
-        or "cuda error: out of memory" in normalized_reason
-        or (
-            "outofmemoryerror" in normalized_reason
-            and "cuda" in normalized_reason
+        any(
+            identifier in normalized_reason
+            for identifier in ("cuda", "cudnn", "cublas", "nccl", "gpu")
         )
+        or (
+            "memoryerror:" in normalized_reason
+            and "batch_size" in normalized_reason
+            and "too large" in normalized_reason
+            and "smaller value" in normalized_reason
+        )
+    )
+
+
+def cuda_failure_reason(result: Analysis) -> str:
+    """Return a CUDA/GPU diagnostic from the analysis or BPM sample notes."""
+    reasons = [result.reason, *(result.bpm_sample_notes or [])]
+    return next(
+        (reason for reason in reasons if is_cuda_failure(reason)),
+        "",
     )
 
 
@@ -2120,17 +2133,17 @@ def analyze_chart_with_cpu_fallback(
     chart_path: Path,
     args: argparse.Namespace,
 ) -> Analysis:
-    """Retry a CUDA out-of-memory failure once on CPU for this chart."""
+    """Retry a CUDA-related failure once on CPU for this chart."""
     result = analyze_chart_in_child_process(chart_path, args)
     if (
         args.device != "cuda"
-        or result.status != "Analysis failed"
-        or not is_cuda_out_of_memory(result.reason)
+        or not cuda_failure_reason(result)
     ):
         return result
 
+    gpu_error = cuda_failure_reason(result)
     print(
-        f"    CUDA out of memory; retrying on CPU: {chart_path.name}",
+        f"    CUDA/GPU error; retrying on CPU: {chart_path.name}",
         flush=True,
     )
     cpu_args = argparse.Namespace(**vars(args))
@@ -2140,23 +2153,23 @@ def analyze_chart_with_cpu_fallback(
         cpu_result = analyze_chart_in_child_process(chart_path, cpu_args)
     except Exception as exc:
         raise RuntimeError(
-            "CUDA out-of-memory attempt failed.\n"
-            f"GPU error: {result.reason}\n"
+            "CUDA/GPU attempt failed.\n"
+            f"CUDA/GPU error: {gpu_error}\n"
             "CPU retry could not complete: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
 
     if cpu_result.status == "Analysis failed":
         cpu_result.reason = (
-            "GPU attempt failed with CUDA out of memory.\n"
-            f"GPU error: {result.reason}\n"
+            "CUDA/GPU attempt failed.\n"
+            f"CUDA/GPU error: {gpu_error}\n"
             "CPU retry also failed.\n"
             f"CPU error: {cpu_result.reason}"
         )
     else:
         cpu_result.reason = (
             f"{cpu_result.reason}\n"
-            "GPU attempt ran out of memory; analysis succeeded on CPU retry."
+            "CUDA/GPU attempt failed; analysis succeeded on CPU retry."
         ).strip()
     return cpu_result
 
@@ -2195,7 +2208,7 @@ def analyze_charts_on_both_devices(
     chart_paths: list[Path],
     args: argparse.Namespace,
 ) -> Iterator[tuple[Path, ChartAnalysisOutput]]:
-    """Analyze charts concurrently on CPU and CUDA, retrying CUDA OOMs on CPU."""
+    """Analyze charts concurrently, retrying CUDA/GPU failures on CPU."""
     with _ACTIVE_CHILD_PROCESSES_LOCK:
         _CHART_PROCESS_TERMINATION_REQUESTED.clear()
 
@@ -2249,30 +2262,30 @@ def analyze_charts_on_both_devices(
                 if (
                     device == "cuda"
                     and not gpu_error
-                    and output.analysis.status == "Analysis failed"
-                    and is_cuda_out_of_memory(output.analysis.reason)
+                    and cuda_failure_reason(output.analysis)
                 ):
+                    gpu_error = cuda_failure_reason(output.analysis)
                     if output.logs:
                         print(output.logs, end="", flush=True)
                     print(
-                        f"CUDA out of memory; queueing CPU retry: {chart_path.name}",
+                        f"CUDA/GPU error; queueing CPU retry: {chart_path.name}",
                         flush=True,
                     )
-                    cpu_retries.appendleft((chart_path, output.analysis.reason))
+                    cpu_retries.appendleft((chart_path, gpu_error))
                 else:
                     if gpu_error:
                         cpu_result = output.analysis
                         if cpu_result.status == "Analysis failed":
                             cpu_result.reason = (
-                                "GPU attempt failed with CUDA out of memory.\n"
-                                f"GPU error: {gpu_error}\n"
+                                "CUDA/GPU attempt failed.\n"
+                                f"CUDA/GPU error: {gpu_error}\n"
                                 "CPU retry also failed.\n"
                                 f"CPU error: {cpu_result.reason}"
                             )
                         else:
                             cpu_result.reason = (
                                 f"{cpu_result.reason}\n"
-                                "GPU attempt ran out of memory; "
+                                "CUDA/GPU attempt failed; "
                                 "analysis succeeded on CPU retry."
                             ).strip()
                     completed_outputs.append((chart_path, output))
@@ -3373,7 +3386,8 @@ def format_report(
 
 
 def format_review_report_entry(result: Analysis) -> str:
-    """Format a review entry for a large GAP correction or drift warning."""
+    """Format a review entry for a failed analysis, large correction, or drift."""
+    failed_analysis = result.status == "Analysis failed"
     eligible_gap = (
         result.audio_path is not None
         and result.suggested_gap_ms is not None
@@ -3382,10 +3396,19 @@ def format_review_report_entry(result: Analysis) -> str:
         and abs(result.correction_ms) >= 1000
         and result.confidence in {"High", "Medium"}
     )
-    if not eligible_gap and not result.gap_drift_warning:
+    if not failed_analysis and not eligible_gap and not result.gap_drift_warning:
         return ""
 
-    lines = [f"Audio: {result.audio_path or 'Not found'}"]
+    lines = [
+        f"Chart: {result.chart_path}",
+        f"Audio: {result.audio_path or 'Not found'}",
+    ]
+    if failed_analysis:
+        failure_reason = (result.reason or "No additional details").splitlines()[0]
+        lines.extend([
+            "Analysis failed",
+            f"Reason: {failure_reason}",
+        ])
     if eligible_gap:
         lines.extend([
             f"GAP Correction: {result.correction_ms:+.0f} ms",

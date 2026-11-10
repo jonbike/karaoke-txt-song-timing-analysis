@@ -58,8 +58,9 @@ window before Demucs runs. The script probes the first audio stream to choose a
 matching snippet extension; for example, MP2 audio in a file named `.mp3` is
 written into a temporary `.mp2` snippet instead of being incorrectly muxed as
 MP3. When BPM analysis is enabled with `--bpm`, Demucs receives the full audio
-so later BPM samples remain available. If a song fails with a CUDA
-out-of-memory error while CUDA is selected, that song is retried once using
+so later BPM samples remain available. If a song encounters a CUDA/GPU error
+while CUDA is selected, including WhisperX's batch-size memory error or an
+error during later BPM sample transcription, that song is retried once using
 CPU and `int8`; the next song still uses the originally selected device.
 
 GStreamer is not used directly by this project and does not need to be
@@ -207,10 +208,10 @@ written, the current value matches the original; successful updates show the
 new chart value as current. A companion report with `_review` appended to the
 filename is also created or overwritten (for example, `gap_report.txt` produces
 `gap_report_review.txt`). It lists eligible Medium/High GAP suggestions whose
-absolute correction is at least 1,000 ms, and also includes every song that
-triggers the opening timing-drift warning described below. Both reports are
-updated after each song is processed. The command also prints progress and
-both report locations to the terminal.
+absolute correction is at least 1,000 ms, every song that triggers the opening
+timing-drift warning described below, and every failed analysis with its chart
+path and failure reason. Both reports are updated after each song is processed.
+The command also prints progress and both report locations to the terminal.
 
 The main report header records the full command line used to run the analysis.
 When `--allow-small-updates` is set, the report notes that the standard size
@@ -235,10 +236,10 @@ enable chart updates for a larger run.
   listening is the best way to catch a chart that still feels out of sync.
 - **Hundreds of songs:** Use the companion `_review` report to prioritize
   eligible Medium/High-confidence GAP suggestions with corrections of at least
-  1,000 ms, along with songs flagged for possible timing drift. It does not
-  include every Medium/Low-confidence result; use the main report to find and
-  review those as well. Check larger corrections and uncertain results before
-  deciding whether to write them.
+  1,000 ms, songs flagged for possible timing drift, and all failed analyses.
+  It does not include every Medium/Low-confidence result; use the main report
+  to find and review those as well. Check larger corrections and uncertain
+  results before deciding whether to write them.
 - **Thousands of songs:** You may decide to accept High-confidence GAP
   suggestions with less manual checking, then focus your time on Medium/Low
   confidence, large corrections, and timing-drift warnings. The right balance
@@ -252,15 +253,15 @@ were meaningfully changed. To write smaller changes, add
 
 BPM analysis is optional (`--bpm`) and samples selected parts of each song.
 Check BPM suggestions and their separate BPM confidence in the main report;
-the companion `_review` report is focused on GAP corrections and timing-drift
-warnings. A BPM estimate can have high BPM confidence but still be
-diagnostic-only when GAP confidence is too low. Even a confident BPM suggestion
-is worth checking by listening. If you enable `--write-bpm`, the tool updates
-an eligible BPM and runs one more analysis to recalculate GAP and verify BPM;
-it does not apply another BPM correction in that same run. Review the result
-and run the tool again if another adjustment seems warranted. Songs that speed
-up or slow down may not have one constant BPM, so any single suggested tempo
-is a compromise.
+the companion `_review` report is focused on failed analyses, GAP corrections,
+and timing-drift warnings. A BPM estimate can have high BPM confidence but
+still be diagnostic-only when GAP confidence is too low. Even a confident BPM
+suggestion is worth checking by listening. If you enable `--write-bpm`, the
+tool updates an eligible BPM and runs one more analysis to recalculate GAP and
+verify BPM; it does not apply another BPM correction in that same run. Review
+the result and run the tool again if another adjustment seems warranted. Songs
+that speed up or slow down may not have one constant BPM, so any single
+suggested tempo is a compromise.
 
 ## Resuming after an interruption
 
@@ -304,7 +305,8 @@ chart's `#GAP` write attempt.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--source` | Required | Directory containing charts and matching audio. |
+| `--help` | — | Show the command-line options and exit. |
+| `--source` | Required | Directory containing charts and matching audio, or a UTF-8 text file listing song directories (one per line). Relative paths in a list file are resolved relative to that file. |
 | `--report` | Required | Text report path; an existing report at this path is overwritten. |
 | `--report-level` | `all` | Report detail level: `all` for full diagnostics or `summary` for key results. |
 | `--language` | Automatic detection | WhisperX language code, such as `de` for German. |
@@ -319,6 +321,7 @@ chart's `#GAP` write attempt.
 | `--bpm` | Off | Enable BPM analysis using sampled song sections. |
 | `--write-gap` | Off | Update charts when a GAP suggestion is eligible; implied by `--write-bpm`. |
 | `--write-bpm` | Off | Update eligible BPM suggestions; requires `--bpm`, also enables GAP writing, and reanalyzes after a BPM update. |
+| `--allow-small-updates` | Off | Allow GAP and BPM writes below their normal size thresholds; other write safeguards still apply. |
 | `--debug` | Off | Include full exception tracebacks in the report. |
 
 ### Running on CPU and CUDA together
@@ -334,10 +337,12 @@ should become more useful as more charts complete. Progress counts chart files,
 not source-list lines or song directories. A directory with multiple duet
 charts contributes multiple jobs to the total.
 
-If a CUDA analysis runs out of memory, its song waits for the CPU worker slot
-and is retried there with `int8`. It does not start an additional CPU analysis
-while that slot is occupied. `--device both` may or may not be faster: CPU,
-memory, or disk contention can offset the benefit of overlapping work.
+If a CUDA analysis encounters a CUDA/GPU error, including WhisperX's
+batch-size memory error or during later BPM sample transcription, its song
+waits for the CPU worker slot and is retried there with `int8`. It does not
+start an additional CPU analysis while that slot is occupied. `--device both`
+may or may not be faster: CPU, memory, or disk contention can offset the
+benefit of overlapping work.
 Benchmark it with representative songs on your machine before relying on a
 speedup. Use `--device both` with caution: whether it is suitable depends on
 your hardware resources, including CPU, GPU, and memory capacity.

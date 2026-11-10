@@ -77,7 +77,7 @@ class BothDeviceAnalysisTests(unittest.TestCase):
                 result = self.make_analysis(
                     chart_path,
                     status="Analysis failed",
-                    reason="CUDA out of memory.",
+                    reason="RuntimeError: cuDNN execution failed.",
                 )
             elif chart_path == charts[1] and device == "cpu":
                 cpu_started.set()
@@ -145,6 +145,41 @@ class BothDeviceAnalysisTests(unittest.TestCase):
             worker_args = worker.call_args.args[1]
             self.assertEqual(worker_args.device, "cpu")
             self.assertEqual(worker_args.compute_type, expected_cpu_type)
+
+    def test_retries_completed_cuda_analysis_when_bpm_sample_ooms(self) -> None:
+        chart_path = Path("/charts/song.txt")
+        args = Namespace(
+            compute_type_explicit=False,
+            compute_type="float16",
+            debug=False,
+        )
+        calls: list[str] = []
+
+        def fake_analyze(
+            path: Path,
+            worker_args: Namespace,
+            device: str,
+        ) -> analysis.ChartAnalysisOutput:
+            calls.append(device)
+            result = self.make_analysis(path)
+            if device == "cuda":
+                result.bpm_sample_notes.append(
+                    "Later BPM sample transcription failed: "
+                    "OutOfMemoryError: CUDA out of memory."
+                )
+            return analysis.ChartAnalysisOutput(result)
+
+        with patch.object(
+            analysis,
+            "_analyze_chart_on_device",
+            side_effect=fake_analyze,
+        ):
+            outputs = list(analysis.analyze_charts_on_both_devices([chart_path], args))
+
+        self.assertEqual(calls, ["cuda", "cpu"])
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0][0], chart_path)
+        self.assertIn("succeeded on CPU retry", outputs[0][1].analysis.reason)
 
     def test_worker_captures_logs_for_parent_process(self) -> None:
         chart_path = Path("/charts/song.txt")

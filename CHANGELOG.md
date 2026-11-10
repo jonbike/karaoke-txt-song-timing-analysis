@@ -2,6 +2,14 @@
 
 Notable user-facing changes are listed here, grouped by project version.
 
+## 0.3.4
+
+- Retry CUDA/GPU analysis failures once on CPU, including failures during later
+  BPM sample transcription.
+- Include every failed chart analysis, with its path and reason, in the
+  companion review report.
+- Document all command-line options in the README.
+
 ## 0.3.3
 
 - Lower the minimum BPM write threshold from 0.50% to 0.35%.
