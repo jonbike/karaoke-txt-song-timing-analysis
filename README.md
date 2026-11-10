@@ -152,6 +152,10 @@ chart updates; omit it to produce a report without changing chart files.
 
 To specify a language instead of using automatic detection, pass a WhisperX
 language code, for example `--language de` for German.
+For Korean songs with a mix of Korean and English lyrics, explicitly setting
+`--language ko` skips automatic language identification and may improve
+transcription and the resulting GAP confidence compared with automatic
+language detection.
 
 For CUDA inference, run the script from the `karaoke_txt_song_timing_analysis/`
 directory. This example with the `medium` model and a batch size of 32 worked
