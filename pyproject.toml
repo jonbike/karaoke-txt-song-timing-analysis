@@ -1,7 +1,7 @@
 [project]
 name = "karaoke-txt-song-timing-analysis"
 version = "0.3.3"
-description = ""
+description = "Analyze UltraStar karaoke charts against audio to estimate GAP and BPM corrections."
 authors = [
     {name = "Jonathan Moore",email = "jonbike@jonathanmoore.eu"}
 ]
