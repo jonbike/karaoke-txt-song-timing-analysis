@@ -10,6 +10,17 @@ from karaoke_txt_song_timing_analysis import karaoke_txt_song_timing_analysis as
 
 
 class ChartWriteTests(unittest.TestCase):
+    def test_unspecified_opening_windows_are_reported_as_automatic(self) -> None:
+        parser = analysis.argparse.ArgumentParser()
+        parser.add_argument("--audio-opening-seconds", type=float, default=60.0)
+        parser.add_argument("--chart-opening-seconds", type=float, default=60.0)
+        args = parser.parse_args([])
+
+        lines = analysis.unspecified_option_default_lines(parser, args, [])
+
+        self.assertIn("  --audio-opening-seconds: automatic", lines)
+        self.assertIn("  --chart-opening-seconds: automatic", lines)
+
     def test_existing_backup_is_archived_before_latest_backup_is_refreshed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             chart_path = Path(temporary_directory) / "song.txt"
@@ -555,7 +566,11 @@ class ChartWriteTests(unittest.TestCase):
 
         report = analysis.format_summary_report([result], args        )
 
-        self.assertIn("WhisperX batch size: 4", report)
+        self.assertNotIn("Match threshold:", report)
+        self.assertNotIn("WhisperX batch size:", report)
+        self.assertNotIn("Safety:", report)
+        self.assertNotIn("Initial audio opening window:", report)
+        self.assertNotIn("Initial chart opening window:", report)
         self.assertIn("Suggested #BPM: 333.152", report)
         self.assertIn("BPM change: +6.78% (increase chart tempo)", report)
         self.assertIn("#BPM write: Updated #BPM from 312 to 333.152.", report)
@@ -563,6 +578,9 @@ class ChartWriteTests(unittest.TestCase):
         detailed_args = analysis.argparse.Namespace(**vars(args))
         detailed_args.report_level = "all"
         detailed_report = analysis.format_report([result], detailed_args)
+        self.assertNotIn("Safety:", detailed_report)
+        self.assertNotIn("Initial audio opening window:", detailed_report)
+        self.assertNotIn("Initial chart opening window:", detailed_report)
         self.assertIn("BPM change: +6.78% (increase chart tempo)", detailed_report)
 
         diagnostic_result = analysis.Analysis(
@@ -705,6 +723,10 @@ class ChartWriteTests(unittest.TestCase):
                         str(source),
                         "--report",
                         str(report_path),
+                        "--audio-opening-seconds",
+                        "60",
+                        "--chart-opening-seconds",
+                        "60",
                         "--write-gap",
                         "--allow-small-updates",
                     ],
@@ -713,11 +735,14 @@ class ChartWriteTests(unittest.TestCase):
                     analysis,
                     "analyze_chart_with_cpu_fallback",
                     return_value=result,
-                ),
+                ) as analyze_chart_mock,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(analysis.main(), 0)
 
+            analyzed_args = analyze_chart_mock.call_args.args[1]
+            self.assertTrue(analyzed_args.audio_opening_seconds_explicit)
+            self.assertTrue(analyzed_args.chart_opening_seconds_explicit)
             self.assertEqual(
                 chart_path.read_text(encoding="utf-8"),
                 "#TITLE:Song\n#GAP: 150\n",
@@ -730,6 +755,12 @@ class ChartWriteTests(unittest.TestCase):
             self.assertIn("Command line: ", report)
             self.assertIn("--source " + str(source), report)
             self.assertIn("--write-gap --allow-small-updates", report)
+            self.assertIn("Options not specified (defaults):", report)
+            self.assertIn("--match-threshold: 0.55", report)
+            self.assertIn("--batch-size: 4", report)
+            self.assertIn("--language: automatic language detection", report)
+            self.assertNotIn("--allow-small-updates:", report)
+            self.assertNotIn("--write-gap:", report)
             self.assertIn(
                 "--allow-small-updates was supplied: the normal GAP and BPM "
                 "size thresholds are bypassed",
@@ -791,6 +822,12 @@ class ChartWriteTests(unittest.TestCase):
 
             report = report_path.read_text(encoding="utf-8")
             self.assertIn("Writing #BPM also enables #GAP writing", report)
+            self.assertIn(
+                "--write-gap: enabled (implied by --write-bpm)",
+                report,
+            )
+            self.assertNotIn("--bpm:", report)
+            self.assertNotIn("--write-bpm:", report)
             self.assertIn("#GAP write: Skipped: GAP confidence is Low", report)
             self.assertIn("Estimated #BPM (diagnostic only): 121.000", report)
             self.assertIn("BPM confidence: High", report)

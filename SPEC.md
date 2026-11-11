@@ -91,12 +91,18 @@ outcomes clear.
 
 1. GAP analysis is always performed when chart, audio, and timing inputs are
    usable; `--bpm` only controls the optional BPM verification.
-2. Start from the configured opening audio and chart windows (both default to
-   60 seconds). Extend either window to at least 90 seconds if fewer than
-   three informative chart words (normalized length at least three) map into
-   both initial windows using the chart's current `#GAP`, or if the first
-   expected lyric falls in the latter half of the audio opening window.
-   Explicitly configured windows longer than 90 seconds remain unchanged.
+2. The audio and chart opening-window options each default to 60 seconds. If
+   an option is explicitly supplied, that window is fixed at the supplied
+   value. If omitted, the corresponding window starts at 60 seconds and can be
+   extended when fewer than three informative chart words (normalized length
+   at least three) map into both initial windows using the chart's current
+   `#GAP`, or when the first expected lyric falls in the latter half of the
+   audio opening window. Automatic windows extend to at least 90 seconds and
+   far enough to include the first three informative chart words. The audio
+   window includes 30 seconds after the last of those words; the chart window
+   ends at its chart time. Each option controls its window independently. This
+   supports lyrics starting later than 90 seconds without applying `#GAP` to
+   the chart window.
 3. Separate vocals with Demucs before WhisperX transcription. Never silently
    fall back to transcribing the original mix after vocal-separation failure.
    With BPM disabled, a temporary stream-copied audio clip one second longer
@@ -241,13 +247,14 @@ outcomes clear.
    when no value is written, current equals original. Include suggested values,
    confidence, reasons, BPM sample details when enabled (including the signed
    percentage BPM change), and the result of each requested chart write.
-   The main report header must include the complete effective command line.
-   When `--allow-small-updates` is supplied, state that the normal GAP/BPM size
-   thresholds are bypassed while other safeguards remain active. If a
-   successful write is below one of those thresholds, its write status must
-   identify the threshold bypassed and that the option enabled the write.
-   Summary reports must retain write outcomes and key BPM information when
-   applicable.
+   The main report header must include the command line and defaults for
+   options not specified on it; omitted opening-window options are described
+   as automatic. When `--allow-small-updates` is supplied, state that the
+   normal GAP/BPM size thresholds are bypassed while other safeguards remain
+   active. If a successful write is below one of those thresholds, its write
+   status must identify the threshold bypassed and that the option enabled the
+   write. Summary reports must retain write outcomes and key BPM information
+   when applicable.
 6. Refuse output paths that would overwrite an existing audio file or
    UltraStar chart. If no eligible charts are found, report that and return a
    non-success exit status.

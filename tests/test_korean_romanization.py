@@ -110,6 +110,28 @@ class SelectGapOpeningWindowsTests(unittest.TestCase):
             (60, 60),
         )
 
+    def test_extends_audio_window_past_90_seconds_for_long_existing_gap(self) -> None:
+        chart_words = [
+            ChartWord(text=text, beat=index, seconds=index, index=index)
+            for index, text in enumerate(("hello", "world", "again"))
+        ]
+
+        self.assertEqual(
+            select_gap_opening_windows(chart_words, 60, 60, 110000),
+            (142, 90),
+        )
+
+    def test_extends_both_windows_to_late_chart_lyrics(self) -> None:
+        chart_words = [
+            ChartWord(text=text, beat=index, seconds=110 + index, index=index)
+            for index, text in enumerate(("hello", "world", "again"))
+        ]
+
+        self.assertEqual(
+            select_gap_opening_windows(chart_words, 60, 60),
+            (142, 112),
+        )
+
     def test_extends_both_windows_when_fewer_than_three_informative_words(self) -> None:
         chart_words = [
             ChartWord(text="hello", beat=0, seconds=10, index=0),
@@ -130,7 +152,7 @@ class SelectGapOpeningWindowsTests(unittest.TestCase):
 
         self.assertEqual(
             select_gap_opening_windows(chart_words, 60, 60),
-            (90, 90),
+            (110, 90),
         )
 
     def test_short_words_do_not_count_as_informative(self) -> None:
@@ -146,6 +168,39 @@ class SelectGapOpeningWindowsTests(unittest.TestCase):
 
     def test_does_not_shrink_explicit_windows_above_90_seconds(self) -> None:
         self.assertEqual(select_gap_opening_windows([], 120, 120), (120, 120))
+
+    def test_explicit_audio_and_chart_windows_disable_auto_extension(self) -> None:
+        chart_words = [
+            ChartWord(text=text, beat=index, seconds=110 + index, index=index)
+            for index, text in enumerate(("hello", "world", "again"))
+        ]
+
+        self.assertEqual(
+            select_gap_opening_windows(
+                chart_words,
+                60,
+                60,
+                auto_extend_audio=False,
+                auto_extend_chart=False,
+            ),
+            (60, 60),
+        )
+
+    def test_explicit_audio_window_can_be_fixed_while_chart_window_extends(self) -> None:
+        chart_words = [
+            ChartWord(text=text, beat=index, seconds=110 + index, index=index)
+            for index, text in enumerate(("hello", "world", "again"))
+        ]
+
+        self.assertEqual(
+            select_gap_opening_windows(
+                chart_words,
+                60,
+                60,
+                auto_extend_audio=False,
+            ),
+            (60, 112),
+        )
 
 
 if __name__ == "__main__":

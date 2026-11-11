@@ -108,6 +108,7 @@ HANGUL_RE = re.compile(
     r"[\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7af\ud7b0-\ud7ff]"
 )
 GAP_WINDOW_FALLBACK_SECONDS = 90.0
+GAP_WINDOW_AUDIO_TAIL_SECONDS = 30.0
 MIN_USABLE_CHART_WORDS = 3
 ETA_SAMPLE_SIZE = 10
 MIN_GAP_DRIFT_MATCHES = 10
@@ -245,14 +246,28 @@ def select_gap_opening_windows(
     audio_opening_seconds: float,
     chart_opening_seconds: float,
     gap_ms: float = 0.0,
+    *,
+    auto_extend_audio: bool = True,
+    auto_extend_chart: bool = True,
 ) -> tuple[float, float]:
-    """Extend sparse or late-starting opening lyric windows to 90 seconds."""
+    """Extend opening windows through the first usable lyric cluster."""
+    if not auto_extend_audio and not auto_extend_chart:
+        return audio_opening_seconds, chart_opening_seconds
+
     gap_seconds = gap_ms / 1000.0
+    expected_words = sorted(
+        (
+            word
+            for word in chart_words
+            if word.seconds + gap_seconds >= 0
+        ),
+        key=lambda word: word.seconds,
+    )
     opening_words = [
         word
-        for word in chart_words
+        for word in expected_words
         if word.seconds <= chart_opening_seconds
-        and 0 <= word.seconds + gap_seconds <= audio_opening_seconds
+        and word.seconds + gap_seconds <= audio_opening_seconds
     ]
     usable_words = sum(
         len(normalize_word(word.text)) >= 3 for word in opening_words
@@ -260,8 +275,7 @@ def select_gap_opening_windows(
     expected_first_lyric = min(
         (
             word.seconds + gap_seconds
-            for word in chart_words
-            if word.seconds + gap_seconds >= 0
+            for word in expected_words
         ),
         default=None,
     )
@@ -269,12 +283,39 @@ def select_gap_opening_windows(
         expected_first_lyric is not None
         and expected_first_lyric >= audio_opening_seconds / 2.0
     )
-    if usable_words >= MIN_USABLE_CHART_WORDS and not starts_late:
+    if (
+        usable_words >= MIN_USABLE_CHART_WORDS
+        and not starts_late
+    ):
         return audio_opening_seconds, chart_opening_seconds
 
+    first_usable_words = [
+        word
+        for word in expected_words
+        if len(normalize_word(word.text)) >= 3
+    ][:MIN_USABLE_CHART_WORDS]
+    required_chart_end = (
+        first_usable_words[-1].seconds if first_usable_words else 0.0
+    )
+    required_audio_end = (
+        first_usable_words[-1].seconds
+        + gap_seconds
+        + GAP_WINDOW_AUDIO_TAIL_SECONDS
+        if first_usable_words
+        else 0.0
+    )
+
     return (
-        max(audio_opening_seconds, GAP_WINDOW_FALLBACK_SECONDS),
-        max(chart_opening_seconds, GAP_WINDOW_FALLBACK_SECONDS),
+        max(
+            audio_opening_seconds,
+            GAP_WINDOW_FALLBACK_SECONDS,
+            required_audio_end,
+        ) if auto_extend_audio else audio_opening_seconds,
+        max(
+            chart_opening_seconds,
+            GAP_WINDOW_FALLBACK_SECONDS,
+            required_chart_end,
+        ) if auto_extend_chart else chart_opening_seconds,
     )
 
 
@@ -1638,6 +1679,12 @@ def analyze_chart(
         args.audio_opening_seconds,
         args.chart_opening_seconds,
         gap_ms,
+        auto_extend_audio=not getattr(
+            args, "audio_opening_seconds_explicit", False
+        ),
+        auto_extend_chart=not getattr(
+            args, "chart_opening_seconds_explicit", False
+        ),
     )
     audio_opening_seconds, _ = opening_windows
 
@@ -1730,6 +1777,12 @@ def _analyze_chart_with_audio(
             args.audio_opening_seconds,
             args.chart_opening_seconds,
             gap_ms,
+            auto_extend_audio=not getattr(
+                args, "audio_opening_seconds_explicit", False
+            ),
+            auto_extend_chart=not getattr(
+                args, "chart_opening_seconds_explicit", False
+            ),
         )
     audio_opening_seconds, chart_opening_seconds = opening_windows
     analysis.audio_opening_seconds = audio_opening_seconds
@@ -2878,6 +2931,49 @@ def bpm_report_baseline_and_correction(
     return baseline, correction
 
 
+def unspecified_option_default_lines(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    command_arguments: list[str],
+) -> list[str]:
+    """List option defaults that were not explicitly supplied on the command line."""
+    supplied_options = {
+        argument.partition("=")[0]
+        for argument in command_arguments
+        if argument.startswith("-")
+    }
+    defaults = []
+    for action in parser._actions:
+        if (
+            not action.option_strings
+            or action.dest == "help"
+            or action.required
+            or supplied_options.intersection(action.option_strings)
+        ):
+            continue
+
+        value = action.default
+        if action.dest == "language" and value is None:
+            value = "automatic language detection"
+        elif action.dest in {
+            "audio_opening_seconds",
+            "chart_opening_seconds",
+        }:
+            value = "automatic"
+        elif action.dest == "compute_type" and value is None:
+            value = (
+                f"automatic (int8 on CPU, float16 on CUDA; "
+                f"resolved to {args.compute_type})"
+            )
+        elif action.dest == "write_gap" and args.write_gap:
+            value = "enabled (implied by --write-bpm)"
+        defaults.append(f"  {action.option_strings[-1]}: {value}")
+
+    if not defaults:
+        return []
+    return ["Options not specified (defaults):", *defaults, ""]
+
+
 def format_summary_report(
     results: list[Analysis],
     args: argparse.Namespace,
@@ -2892,10 +2988,7 @@ def format_summary_report(
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Command line: {getattr(args, 'command_line', 'Not captured')}",
             "",
-            f"Match threshold: {args.match_threshold:.2f}",
-            f"WhisperX batch size: {args.batch_size}",
-            f"Initial audio opening window: {args.audio_opening_seconds:.1f} seconds",
-            f"Initial chart opening window: {args.chart_opening_seconds:.1f} seconds",
+            *getattr(args, "unspecified_option_lines", []),
             (
                 "Writing #BPM also enables #GAP writing; a successful BPM "
                 "update triggers a second analysis pass before GAP is written."
@@ -3066,19 +3159,7 @@ def format_report(
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Command line: {getattr(args, 'command_line', 'Not captured')}",
             "",
-            (
-                "Safety: source audio and chart files were read only."
-                if not (args.write_gap or args.write_bpm)
-                else (
-                    "Safety: source audio is read only; eligible chart values "
-                    "are updated only at Medium or High confidence, after a "
-                    ".bak backup."
-                )
-            ),
-            f"Match threshold: {args.match_threshold:.2f}",
-            f"WhisperX batch size: {args.batch_size}",
-            f"Initial audio opening window: {args.audio_opening_seconds:.1f} seconds",
-            f"Initial chart opening window: {args.chart_opening_seconds:.1f} seconds",
+            *getattr(args, "unspecified_option_lines", []),
             (
                 "Writing #BPM also enables #GAP writing; a successful BPM "
                 "update triggers a second analysis pass before GAP is written."
@@ -3560,8 +3641,9 @@ def main() -> int:
         type=float,
         default=60.0,
         help=(
-            "Minimum audio opening window to transcribe; sparse chart lyrics "
-            "may extend it to 90 seconds (default: 60)."
+            "Fixed audio opening window when specified. If omitted, starts "
+            "at 60 seconds and may extend through the first three usable "
+            "words plus 30 seconds (default: 60)."
         ),
     )
     parser.add_argument(
@@ -3569,8 +3651,9 @@ def main() -> int:
         type=float,
         default=60.0,
         help=(
-            "Minimum chart opening window to consider; sparse lyrics may "
-            "extend it to 90 seconds (default: 60)."
+            "Fixed chart opening window when specified. If omitted, starts "
+            "at 60 seconds and may extend through the first three usable "
+            "words (default: 60)."
         ),
     )
     parser.add_argument(
@@ -3615,8 +3698,20 @@ def main() -> int:
         help="Include full exception tracebacks in the report.",
     )
 
-    args = parser.parse_args()
+    command_arguments = sys.argv[1:]
+    args = parser.parse_args(command_arguments)
     args.command_line = shlex.join([sys.executable, *sys.argv])
+    supplied_options = {
+        argument.partition("=")[0]
+        for argument in command_arguments
+        if argument.startswith("-")
+    }
+    args.audio_opening_seconds_explicit = (
+        "--audio-opening-seconds" in supplied_options
+    )
+    args.chart_opening_seconds_explicit = (
+        "--chart-opening-seconds" in supplied_options
+    )
 
     if not 0.0 <= args.match_threshold <= 1.0:
         parser.error("--match-threshold must be between 0 and 1.")
@@ -3635,6 +3730,11 @@ def main() -> int:
     args.compute_type_explicit = args.compute_type is not None
     if args.compute_type is None:
         args.compute_type = "int8" if args.device == "cpu" else "float16"
+    args.unspecified_option_lines = unspecified_option_default_lines(
+        parser,
+        args,
+        command_arguments,
+    )
 
     source = Path(args.source).expanduser().resolve()
     report_path = Path(args.report).expanduser().resolve()

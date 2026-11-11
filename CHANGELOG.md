@@ -2,6 +2,13 @@
 
 Notable user-facing changes are listed here, grouped by project version.
 
+## 0.3.5
+
+- Automatically extend omitted opening-window options to cover late opening
+  lyrics; explicitly supplied audio and chart window values remain fixed.
+- List omitted command-line options and their defaults in report headers, and
+  remove redundant safety and initial-window lines.
+
 ## 0.3.4
 
 - Retry CUDA/GPU analysis failures once on CPU, including failures during later

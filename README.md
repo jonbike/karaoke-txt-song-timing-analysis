@@ -213,10 +213,12 @@ timing-drift warning described below, and every failed analysis with its chart
 path and failure reason. Both reports are updated after each song is processed.
 The command also prints progress and both report locations to the terminal.
 
-The main report header records the full command line used to run the analysis.
-When `--allow-small-updates` is set, the report notes that the standard size
-thresholds are bypassed; any GAP or BPM write that relies on this option also
-states that explicitly in its write status.
+The main report header records the full command line used to run the analysis
+and lists defaults for options omitted from it. Omitted opening-window options
+are shown as `automatic`, because their windows may extend to cover late
+opening lyrics. When `--allow-small-updates` is set, the report notes that the
+standard size thresholds are bypassed; any GAP or BPM write that relies on
+this option also states that explicitly in its write status.
 
 ## Typical workflow and review tips
 
@@ -315,8 +317,8 @@ chart's `#GAP` write attempt.
 | `--compute-type` | Device-dependent | WhisperX compute type; defaults to `int8` on CPU and `float16` on CUDA. In `both` mode, those defaults apply to their respective workers; an explicit value is used on both. |
 | `--batch-size` | `4` | WhisperX transcription batch size. Choose `4`, `8`, `16`, `32`, or `64`; larger batches use more memory. |
 | `--match-threshold` | `0.55` | Minimum fuzzy word similarity from 0 to 1. Lower values allow less-exact matches. |
-| `--audio-opening-seconds` | `60` | Minimum opening audio window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
-| `--chart-opening-seconds` | `60` | Minimum chart opening window; may extend to 90 seconds when chart lyrics are sparse or the current `#GAP` puts their start late in the window. |
+| `--audio-opening-seconds` | `60` | Fixed audio opening window when specified; if omitted, starts at 60 seconds and may extend to cover the first three informative lyrics plus 30 seconds. |
+| `--chart-opening-seconds` | `60` | Fixed chart opening window when specified; if omitted, starts at 60 seconds and may extend to cover the first three informative lyrics. |
 | `--max-correction-ms` | `15000` | Maximum correction allowed for a GAP suggestion. |
 | `--bpm` | Off | Enable BPM analysis using sampled song sections. |
 | `--write-gap` | Off | Update charts when a GAP suggestion is eligible; implied by `--write-bpm`. |
@@ -433,8 +435,14 @@ localized outlier.
   word times into audio time using the current `#GAP`. If fewer than three
   informative chart words (at least three characters each) fall in both
   initial windows, or the first lyric is expected in the latter half of the
-  audio window, both windows extend to 90 seconds. Explicitly configured
-  windows longer than 90 seconds are preserved. When BPM verification is off,
+  audio window, the windows extend to at least 90 seconds and far enough to
+  include the first three informative chart words, unless the corresponding
+  opening-window option was explicitly specified. Explicitly specified audio
+  and chart windows are fixed independently. The audio window includes
+  an additional 30 seconds after those words; the chart window ends at the
+  third word's chart time. This allows long intros, including starts later than
+  90 seconds, to be analyzed without extending the chart window by the current
+  `#GAP`. Configured windows are never shortened. When BPM verification is off,
   Demucs is run on a temporary audio clip one second longer than the selected
   audio window; with `--bpm`, it uses the full audio to allow later samples.
   It does not transcribe the entire song for the GAP estimate.
